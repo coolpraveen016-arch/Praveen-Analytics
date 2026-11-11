@@ -164,6 +164,49 @@ def make_reports(jobs, d1, d2):
     return to_bytes(wb), previews
 
 
+# ---------- 1b) NDC / DC office-wise reports ----------
+OFFICE_HEAD = ["S.No.", "Name of the Office", "Division"]
+
+
+def read_offices(f):
+    """Raw NDC/DC file -> ([(office, division, [5 counts])] in file order, set of Office Types)."""
+    data = io.BytesIO(f.getvalue())
+    df = pd.read_csv(data) if f.name.lower().endswith(".csv") else pd.read_excel(data)
+    miss = [c for c in ["Office Name"] + RAW_COLS[1:] if c not in df.columns]
+    if miss:
+        raise ValueError(f"{f.name}: these columns are missing: " + ", ".join(miss))
+    types = {str(t).strip().upper() for t in df["Office Type"].dropna()} if "Office Type" in df.columns else set()
+    if "Division Name" not in df.columns:
+        df["Division Name"] = ""
+    df["Office Name"] = df["Office Name"].astype(str).str.split().str.join(" ")
+    df["Division Name"] = df["Division Name"].fillna("").astype(str).str.split().str.join(" ")
+    for c in RAW_COLS[1:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    g = df.groupby("Office Name", sort=False).agg({"Division Name": "first", **{c: "sum" for c in RAW_COLS[1:]}})
+    return [(n, r["Division Name"], [float(r[c]) for c in RAW_COLS[1:]]) for n, r in g.iterrows()], types
+
+
+def make_office_reports(jobs, d1, d2):
+    """jobs = [(sheet_name, label, offices)] -> (workbook bytes, previews)."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    previews = {}
+    for sheet, label, offices in jobs:
+        title = f"Delivery Transit Analysis {label} -{d1:%d.%m.%Y} to {d2:%d.%m.%Y}"
+        tot = [sum(o[2][i] for o in offices) for i in range(5)]
+        table = ([[i + 1, n, dv] + metrics(c) for i, (n, dv, c) in enumerate(offices)]
+                 + [["", "Total", ""] + metrics(tot)])
+        ws = wb.create_sheet(sheet)
+        write_block(ws, 1, title, OFFICE_HEAD + HEAD, table, [None] * 3 + FMT_HEAD)
+        ws.column_dimensions["A"].width = 7
+        ws.column_dimensions["B"].width = ws.column_dimensions["C"].width = 30
+        for col in range(4, 16):
+            ws.column_dimensions[L(col)].width = 14
+        ws.freeze_panes = "C1"
+        previews[sheet] = [(title, pd.DataFrame(table, columns=OFFICE_HEAD + HEAD))]
+    return to_bytes(wb), previews
+
+
 # ---------- 2) Compare two report files ----------
 def parse_block(raw, hdr, name_col):
     roles = {}
@@ -341,6 +384,46 @@ def page_generate(st):
             tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
 
 
+def page_ndc_dc(st):
+    sb = st.sidebar
+    sb.divider()
+    sb.header("Report Period")
+    c1, c2 = sb.columns(2)
+    today = datetime.date.today()
+    d1 = c1.date_input("From", today.replace(day=1), key="nd_d1")
+    d2 = c2.date_input("To", today, key="nd_d2")
+    sb.divider()
+    sb.header("Upload Report Files")
+    f_ndc = sb.file_uploader("NDCs file", type=["csv", "xlsx"], key="ndc_file")
+    f_dc = sb.file_uploader("DCs file", type=["csv", "xlsx"], key="dc_file")
+    st.title("Delivery Transit Analysis (D+0) - NDCs / DCs")
+    st.info("Upload the **NDCs** file and/or the **DCs** file from the sidebar. "
+            "Each gets its own office-wise D+0 report, and both come in one master Excel.")
+    jobs = []
+    try:
+        for sheet, f in [("NDCs", f_ndc), ("DCs", f_dc)]:
+            if not f:
+                continue
+            offices, types = read_offices(f)
+            if sheet == "NDCs" and types and "NDC" not in types:
+                st.warning(f"{f.name} does not look like an NDC file (Office Type: {', '.join(sorted(types))}).")
+            if sheet == "DCs" and "NDC" in types:
+                st.warning(f"{f.name} looks like an NDC file - did you put it in the DCs box?")
+            jobs.append((sheet, sheet, offices))
+    except Exception as e:
+        st.error(f"Could not read the files: {e}")
+        return
+    if not jobs:
+        return
+    data, previews = make_office_reports(jobs, d1, d2)
+    st.download_button("Download NDC / DC Reports (Excel)", data, "NDC_DC_D0_Reports.xlsx", XLSX, type="primary")
+    fmt = {h: "{:.2%}" if i in PCT else "{:,.0f}" for i, h in enumerate(HEAD)}
+    for tab, blocks in zip(st.tabs(list(previews)), previews.values()):
+        for title, df in blocks:
+            tab.subheader(title)
+            tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
+
+
 def page_compare(st):
     st.title("Delivery Transit Analysis (D+0) - Period Comparison")
     st.info("Upload the two report Excel files you want to compare (reports made by this app, or the "
@@ -370,8 +453,9 @@ def main():
     st.set_page_config(page_title="D+0 Analytics", layout="wide")
     if not login(st):
         return
-    page = st.sidebar.radio("Select", ["Generate D+0 Reports", "Compare Two Periods"])
-    (page_generate if page.startswith("Generate") else page_compare)(st)
+    pages = {"Generate D+0 Reports": page_generate, "Generate NDC / DC Reports": page_ndc_dc,
+             "Compare Two Periods": page_compare}
+    pages[st.sidebar.radio("Select", list(pages))](st)
 
 
 if __name__ == "__main__":
