@@ -207,6 +207,93 @@ def make_office_reports(jobs, d1, d2):
     return to_bytes(wb), previews
 
 
+# ---------- 1c) Day-wise comparison (DCs / NDCs picked out of full all-offices files) ----------
+GROUPS = {"DCs (DC / IDC)": re.compile(r"\bI?DC\b", re.I), "NDCs": re.compile(r"\bNDC\b", re.I)}
+TOTAL_LABEL = "HQR"
+BLUE, CREAM = PatternFill("solid", fgColor="DDEBF7"), PatternFill("solid", fgColor="FFF2CC")
+GOOD, BAD = PatternFill("solid", fgColor="C6EFCE"), PatternFill("solid", fgColor="FFC7CE")
+
+
+def pick_group(offices, rx):
+    return {" ".join(n.lower().split()): (n, dv, c) for n, dv, c in offices if rx.search(n)}
+
+
+def day_compare(g1, g2):
+    """-> (rows sorted by % Inc/Dec, total). row = (office, division, counts_day1, counts_day2)."""
+    zero = (None, "", [0.0] * 5)
+    rows = []
+    for k in list(g2) + [k for k in g1 if k not in g2]:
+        a, b = g1.get(k, zero), g2.get(k, zero)
+        div = re.sub(r"\s*division\s*$", "", b[1] or a[1], flags=re.I)
+        rows.append((b[0] or a[0], div, a[2], b[2]))
+    rows.sort(key=lambda r: sd(r[3][3], r[3][0]) - sd(r[2][3], r[2][0]))
+    total = tuple([sum(r[i][k] for r in rows) for k in range(5)] for i in (2, 3))
+    return rows, total
+
+
+def day_table(rows, total, detailed):
+    idx, heads = ([0, 1, 2, 3, 4], ["Received", "Same Day Invoiced", "Delivered", "Redirected", "Returned"]) \
+        if detailed else ([0, 3], ["Received", "Redirected"])
+    heads = heads + ["Redirection %"]
+    table = []
+    lines = [(i + 1, d, n, a, b) for i, (n, d, a, b) in enumerate(rows)] + [("", "Total", TOTAL_LABEL, *total)]
+    for sno, div, name, a, b in lines:
+        p1, p2 = sd(a[3], a[0]), sd(b[3], b[0])
+        table.append([sno, div, name] + [a[j] for j in idx] + [p1] + [b[j] for j in idx] + [p2] + [p2 - p1])
+    return heads, table
+
+
+def write_day_sheet(ws, title, d1, d2, heads, table):
+    n = len(heads)
+    b1, b2, last = 4, 4 + n, 4 + 2 * n
+
+    def put(r, col, v, fill=None, bold=False, size=11, fmt=None, color=None):
+        c = ws.cell(r, col, v)
+        c.border, c.font = BOX, Font(name="Calibri", bold=bold, size=size, color=color)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        if fill:
+            c.fill = fill
+        if fmt:
+            c.number_format = fmt
+
+    put(1, 1, title, bold=True, size=18)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=3)
+    for col, d, fill in ((b1, d1, BLUE), (b2, d2, CREAM)):
+        put(1, col, f"{d:%d.%m.%Y}", fill, True, 16)
+        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + n - 1)
+    put(1, last, "", GOOD)
+    for j, h in enumerate(["S.No.", "Division Name", "Office Name"]):
+        put(2, 1 + j, h, YELLOW, True)
+    for b, fill in ((b1, BLUE), (b2, CREAM)):
+        for j, h in enumerate(heads):
+            put(2, b + j, h, fill, True)
+    put(2, last, "% Inc/Dec", BAD, True, color="C00000")
+    for k, row in enumerate(table):
+        r, is_total = 3 + k, k == len(table) - 1
+        for j, v in enumerate(row):
+            col = j + 1
+            fill = YELLOW if is_total else (BLUE if b1 <= col < b2 else CREAM if b2 <= col < last else None)
+            fmt = "0.00%" if col in (b1 + n - 1, b2 + n - 1, last) else ("0" if col >= b1 else None)
+            color = None
+            if col == last:
+                fill, color = (GOOD, "006100") if v < 0 else (BAD, "9C0006") if v > 0 else (fill, None)
+            put(r, col, v, fill, is_total, fmt=fmt, color=color)
+    ws.row_dimensions[1].height = ws.row_dimensions[2].height = 38
+    ws.column_dimensions["A"].width, ws.column_dimensions["B"].width, ws.column_dimensions["C"].width = 7, 24, 26
+    for col in range(4, last + 1):
+        ws.column_dimensions[L(col)].width = 13
+    ws.freeze_panes = "D3"
+
+
+def day_workbook(title, d1, d2, rows, total):
+    wb = Workbook()
+    wb.remove(wb.active)
+    for name, detailed in (("Summary", False), ("Detailed", True)):
+        heads, table = day_table(rows, total, detailed)
+        write_day_sheet(wb.create_sheet(name), title, d1, d2, heads, table)
+    return to_bytes(wb)
+
+
 # ---------- 2) Compare two report files ----------
 def parse_block(raw, hdr, name_col):
     roles = {}
@@ -424,6 +511,50 @@ def page_ndc_dc(st):
             tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
 
 
+def page_day(st):
+    sb = st.sidebar
+    sb.divider()
+    sb.header("Dates")
+    today = datetime.date.today()
+    d1 = sb.date_input("Earlier date", today - datetime.timedelta(days=2), key="dd_d1")
+    d2 = sb.date_input("Later date", today - datetime.timedelta(days=1), key="dd_d2")
+    sb.divider()
+    sb.header("Upload Report Files")
+    f1 = sb.file_uploader("Earlier date file", type=["csv", "xlsx"], key="dd_f1")
+    f2 = sb.file_uploader("Later date file", type=["csv", "xlsx"], key="dd_f2")
+    sb.divider()
+    grp = sb.selectbox("Offices to include", list(GROUPS))
+    title = sb.text_input("Report title", "Speed Post Document")
+    st.title("Day-wise Comparison - Redirection")
+    st.info("Upload the full all-offices file of the **earlier date** and of the **later date** "
+            "(same product, e.g. Speed Letter). The DCs are picked out automatically, compared, and "
+            "sorted by % Inc/Dec (biggest improvement first).")
+    if not (f1 and f2):
+        return
+    try:
+        g1 = pick_group(read_offices(f1)[0], GROUPS[grp])
+        g2 = pick_group(read_offices(f2)[0], GROUPS[grp])
+        if not g1 or not g2:
+            raise ValueError("no matching offices found in one of the files")
+        rows, total = day_compare(g1, g2)
+    except Exception as e:
+        st.error(f"Could not make the comparison: {e}")
+        return
+    for a, b, lab in ((g1, g2, "later"), (g2, g1, "earlier")):
+        for k in a:
+            if k not in b:
+                st.warning(f"{a[k][0]} is missing in the {lab} date file - counted as zero there.")
+    st.caption(f"{len(rows)} offices compared.")
+    st.download_button("Download Comparison Excel", day_workbook(title, d1, d2, rows, total),
+                       "Day_wise_Comparison.xlsx", XLSX, type="primary")
+    for tab, detailed in zip(st.tabs(["Summary", "Detailed"]), (False, True)):
+        heads, table = day_table(rows, total, detailed)
+        cols = (["S.No.", "Division Name", "Office Name"] + [f"{d1:%d.%m} {h}" for h in heads]
+                + [f"{d2:%d.%m} {h}" for h in heads] + ["% Inc/Dec"])
+        fmt = {c: "{:.2%}" if ("%" in c) else "{:,.0f}" for c in cols[3:]}
+        tab.dataframe(pd.DataFrame(table, columns=cols).style.format(fmt), hide_index=True, use_container_width=True)
+
+
 def page_compare(st):
     st.title("Delivery Transit Analysis (D+0) - Period Comparison")
     st.info("Upload the two report Excel files you want to compare (reports made by this app, or the "
@@ -453,8 +584,8 @@ def main():
     st.set_page_config(page_title="D+0 Analytics", layout="wide")
     if not login(st):
         return
-    pages = {"Generate Region Wise D+0 Reports": page_generate, "Generate NDC / DC Reports": page_ndc_dc,
-             "Compare Two Periods": page_compare}
+    pages = {"Generate D+0 Reports": page_generate, "Generate NDC / DC Reports": page_ndc_dc,
+             "Day-wise DC Comparison": page_day, "Compare Two Periods": page_compare}
     pages[st.sidebar.radio("Select", list(pages))](st)
 
 
