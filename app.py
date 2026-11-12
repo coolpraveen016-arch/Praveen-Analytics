@@ -310,12 +310,19 @@ def read_hq(f):
     """Office Level export -> list of {id, div, sub, name, c=[5 counts]}."""
     data = io.BytesIO(f.getvalue())
     df = pd.read_csv(data) if f.name.lower().endswith(".csv") else pd.read_excel(data)
-    miss = [c for c in ["Division Name", "Sub Division Name", "Office Name"] + RAW_COLS[1:] if c not in df.columns]
+    miss = [c for c in ["Division Name", "Office Name"] + RAW_COLS[1:] if c not in df.columns]
     if miss:
         raise ValueError(f"{f.name}: these columns are missing: {', '.join(miss)}. "
-                         "Please upload the Office Level export (Aggregation Level = Office Level).")
-    if (df["Office Name"] == df["Division Name"]).all() or (df["Office Name"] == df["Sub Division Name"]).all():
-        raise ValueError(f"{f.name} is a Division / Sub Division level export. Please upload the Office Level export.")
+                         "Please upload the raw export from the portal.")
+    if "Sub Division Name" not in df.columns:
+        df["Sub Division Name"] = ""
+        rank = 0                                   # Division Level export
+    elif (df["Office Name"] == df["Sub Division Name"]).all():
+        rank = 1                                   # Sub Division Level export
+    elif (df["Office Name"] == df["Division Name"]).all():
+        rank = 0
+    else:
+        rank = 2                                   # Office Level export
     for c in RAW_COLS[1:]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     rows = []
@@ -323,7 +330,7 @@ def read_hq(f):
         div, sub, name = clean(r["Division Name"]), clean(r["Sub Division Name"]), clean(r["Office Name"])
         oid = str(r["office_id"]) if "office_id" in r and pd.notna(r["office_id"]) else f"{div}|{sub}|{name}|{i}"
         rows.append({"id": oid, "div": div, "sub": sub, "name": name, "c": [float(r[c]) for c in RAW_COLS[1:]]})
-    return rows
+    return rows, rank
 
 
 def hq_aggregate(rows, level):
@@ -386,12 +393,19 @@ def hq_block(title, level, d, recv):
 
 
 def make_hq_reports(jobs, levels, bases, d1, d2):
-    """jobs = [(sheet, report name, [All Offices row-lists], [BO row-lists])]; bases = [True (received), False (invoiced)]."""
+    """jobs = [(sheet, report name, [All Offices row-lists], [BO row-lists], file level rank 0/1/2)];
+    bases = [True (received), False (invoiced)]. Returns (bytes, previews, notes)."""
     wb = Workbook()
     wb.remove(wb.active)
-    previews = {}
-    for sheet, rname, all_f, bo_f in jobs:
+    previews, notes = {}, []
+    need = {"Division": 0, "Sub Division": 1, "Office": 2}
+    label = {"Division": "any export", "Sub Division": "a Sub Division Level or Office Level export",
+             "Office": "an Office Level export"}
+    for sheet, rname, all_f, bo_f, rank in jobs:
         for level in levels:
+            if need[level] > rank:
+                notes.append(f"{rname}: {level}-wise report skipped - it needs {label[level]}.")
+                continue
             a = hq_add([hq_aggregate(r, level) for r in all_f])
             scopes = [("All Offices", a)]
             if bo_f:
@@ -414,7 +428,9 @@ def make_hq_reports(jobs, levels, bases, d1, d2):
                 ws.freeze_panes = "C1"
                 previews[ws.title] = [(t, pd.DataFrame(tb, columns=[h.replace("\n", " ") for h in hd]), fm)
                                       for t, hd, tb, fm in blocks]
-    return to_bytes(wb), previews
+    if not previews:
+        raise ValueError(" ".join(notes) or "Nothing to make.")
+    return to_bytes(wb), previews, notes
 
 
 # ---------- 2) Compare two report files ----------
@@ -692,8 +708,9 @@ def page_hq(st):
     lv = sb.multiselect("Report level", list(LEVELS), default=["Division-wise"], key="hq_lv")
     sb.divider()
     sb.header("Upload Report Files")
-    sb.caption("Upload the **Office Level** export (Aggregation Level = Office Level). "
-               "Division and Sub Division totals are calculated automatically.")
+    sb.caption("Upload the export from the portal at any level. **Office Level** gives Division, Sub Division "
+               "and Office wise reports; **Sub Division Level** gives Division and Sub Division wise; "
+               "**Division Level** gives Division wise.")
     up = lambda label, key: sb.file_uploader(label, type=["csv", "xlsx"], key=key)
     sb.subheader("1️⃣ All Products")
     ap_all, ap_bo = up("All Offices file", "hq_ap_all"), up("BOs file (optional)", "hq_ap_bo")
@@ -704,7 +721,7 @@ def page_hq(st):
     sp_bo, rp_bo = up("Speed Parcel - BOs (optional)", "hq_sp_bo"), up("Regd. Parcel - BOs (optional)", "hq_rp_bo")
 
     st.title("HQ Delivery Transit Analysis (D+0)")
-    st.info("Upload the Office Level raw files from the sidebar. Choose whether all % are worked out on "
+    st.info("Upload the raw files from the sidebar. Choose whether all % are worked out on "
             "**Received** or on **Invoiced** (or get both), and which levels you want "
             "(Division / Sub Division / Office). With a BOs file you also get the BOs and Excluding-BOs tables; "
             "Excluding-BOs = All Offices - BOs.")
@@ -722,14 +739,21 @@ def page_hq(st):
                 continue
             if len(alls) < need or (bos and len(bos) < need):
                 st.warning(f"{rname}: only some of the files were uploaded, so the figures are incomplete.")
-            jobs.append((sheet, rname, [read_hq(f) for f in alls], [read_hq(f) for f in bos]))
+            ra, rb = [read_hq(f) for f in alls], [read_hq(f) for f in bos]
+            jobs.append((sheet, rname, [x[0] for x in ra], [x[0] for x in rb], min(x[1] for x in ra + rb)))
     except Exception as e:
         st.error(f"Could not read the files: {e}")
         return
     if not jobs:
         return
     bases = {"Received": [True], "Invoiced": [False]}.get(base, [True, False])
-    data, previews = make_hq_reports(jobs, [LEVELS[k] for k in LEVELS if k in lv], bases, d1, d2)
+    try:
+        data, previews, notes = make_hq_reports(jobs, [LEVELS[k] for k in LEVELS if k in lv], bases, d1, d2)
+    except Exception as e:
+        st.error(f"Could not make the report: {e}")
+        return
+    for n in notes:
+        st.warning(n)
     st.download_button("Download HQ D+0 Reports (Master Excel Workbook)", data, "HQ_D0_Reports.xlsx", XLSX,
                        type="primary")
     for tab, blocks in zip(st.tabs(list(previews)), previews.values()):
