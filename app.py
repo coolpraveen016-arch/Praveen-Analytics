@@ -300,6 +300,12 @@ LEVEL_PARENTS = {"Division": [], "Sub Division": ["Division"], "Office": ["Divis
 LEVEL_SHORT = {"Division": "Div", "Sub Division": "Sub Div", "Office": "Office"}
 LEVEL_TITLE = {"Division": "", "Sub Division": "Sub Division wise - ", "Office": "Office wise - "}
 HQ_FMT = ["#,##0", "#,##0", "0.00%", "#,##0", "0.00%", "#,##0", "0.00%", "#,##0", "0.00%", "0.00%", "#,##0", "0.00%"]
+SORT_OPTIONS = {"Name (Division / Sub Division / Office)": -1, "Received": 0, "Invoiced": 1, "Invoiced %": 2,
+                "D+0 Delivered": 3, "D+0 Delivered %": 4, "D+0 Redirected": 5, "D+0 Redirected %": 6,
+                "D+0 Returned": 7, "D+0 Returned %": 8, "D+0 (Delivered+Returned+Redirected) %": 9,
+                "Return + Redirection": 10, "Return + Redirection %": 11}
+SORT_DEFAULT = "Return + Redirection %"
+ORDERS = ["Ascending (low to high)", "Descending (high to low)"]
 
 
 def clean(x):
@@ -370,12 +376,12 @@ def hq_sub(a, b):
     return out
 
 
-def hq_block(title, level, d, recv):
+def hq_block(title, level, d, recv, sort=11, desc=False):
     """One table. recv=True -> all % on Received, False -> all % on Invoiced. Sorted by Return+Redirection %."""
     on = "On received" if recv else "On invoiced"
     den = (lambda c: c[0]) if recv else (lambda c: c[1])
     items = [v for v in d.values() if any(v[2])]
-    items.sort(key=lambda v: sd(v[2][3] + v[2][4], den(v[2])))
+    items.sort(key=(lambda v: v[0].lower()) if sort < 0 else (lambda v: hq_metrics(v[2], recv)[sort]), reverse=desc)
     npar = len(LEVEL_PARENTS[level])
 
     def line(sno, name, par, c):
@@ -392,7 +398,7 @@ def hq_block(title, level, d, recv):
     return title, heads, table, [None] * (2 + npar) + HQ_FMT
 
 
-def make_hq_reports(jobs, levels, bases, d1, d2):
+def make_hq_reports(jobs, levels, bases, d1, d2, sort=11, desc=False):
     """jobs = [(sheet, report name, [All Offices row-lists], [BO row-lists], file level rank 0/1/2)];
     bases = [True (received), False (invoiced)]. Returns (bytes, previews, notes)."""
     wb = Workbook()
@@ -413,7 +419,7 @@ def make_hq_reports(jobs, levels, bases, d1, d2):
                 scopes += [("BOs", b), ("Excluding BOs", hq_sub(a, b))]
             for recv in bases:
                 blocks = [hq_block(f"Delivery Transit Analysis {rname}- {LEVEL_TITLE[level]}{sc} "
-                                   f"-{d1:%d.%m.%Y} to {d2:%d.%m.%Y}", level, d, recv) for sc, d in scopes]
+                                   f"-{d1:%d.%m.%Y} to {d2:%d.%m.%Y}", level, d, recv, sort, desc) for sc, d in scopes]
                 name = (sheet + (f" - {LEVEL_SHORT[level]}" if len(levels) > 1 else "")
                         + ((" (Rcvd)" if recv else " (Inv)") if len(bases) > 1 else ""))[:31]
                 ws, r0, npar = wb.create_sheet(name), 1, len(LEVEL_PARENTS[level])
@@ -430,6 +436,159 @@ def make_hq_reports(jobs, levels, bases, d1, d2):
                                       for t, hd, tb, fm in blocks]
     if not previews:
         raise ValueError(" ".join(notes) or "Nothing to make.")
+    return to_bytes(wb), previews, notes
+
+
+# ---------- 1e) HQ D+0 comparison: every column as 1st Period | 2nd Period | Comparison ----------
+DIRN = [0, 0, 1, 0, 1, 0, -1, 0, -1, 1, 0, -1]     # +1 higher is better, -1 lower is better, 0 neutral
+CHG = {"#,##0": "+#,##0;-#,##0;0", "0.00%": "+0.00%;-0.00%;0.00%"}
+TRIO_FMT = [x for f in HQ_FMT for x in (f, f, CHG[f])]
+FMT_PY = {"#,##0": "{:,.0f}", "0.00%": "{:.2%}", CHG["#,##0"]: "{:+,.0f}", CHG["0.00%"]: "{:+.2%}"}
+GREY = PatternFill("solid", fgColor="E7E6E6")
+HQ_GROUPS = [("All Products", "All Products", ["ap_all"], ["ap_bo"], 1),
+             ("Speed Letter", "Speed Post Document", ["sl_all"], ["sl_bo"], 1),
+             ("Parcels", "Consolidated Parcels", ["sp_all", "rp_all"], ["sp_bo", "rp_bo"], 2)]
+
+
+def hq_metrics(c, recv):
+    dn, rr = (c[0] if recv else c[1]), c[3] + c[4]
+    return [c[0], c[1], sd(c[1], c[0]), c[2], sd(c[2], dn), c[3], sd(c[3], dn), c[4], sd(c[4], dn),
+            sd(c[2] + rr, dn), rr, sd(rr, dn)]
+
+
+def trio_heads(on):
+    return ["Received", "Invoiced", "Invoiced %", "D+0 Delivered", f"D+0 Delivered %\n({on})",
+            "D+0 Redirected", f"D+0 Redirected %\n({on})", "D+0 Returned", f"D+0 Returned %\n({on})",
+            f"D+0 (Delivered+Returned+Redirected)\n({on})", "Return + Redirection",
+            f"Return + Redirection %\n({on})"]
+
+
+def hq_scopes(all_f, bo_f, level):
+    a = hq_add([hq_aggregate(r, level) for r in all_f])
+    out = [("All Offices", a)]
+    if bo_f:
+        b = hq_add([hq_aggregate(r, level) for r in bo_f])
+        out += [("BOs", b), ("Excluding BOs", hq_sub(a, b))]
+    return out
+
+
+def trio_table(level, d1, d2, recv, sort=11, desc=False, on=1):
+    """Rows sorted by the chosen column (on: 0 = 1st period, 1 = 2nd period, 2 = comparison); last row = Total."""
+    items = []
+    for k in list(d2) + [k for k in d1 if k not in d2]:
+        src = d2[k] if k in d2 else d1[k]
+        c1, c2 = (d1[k][2] if k in d1 else [0.0] * 5), (d2[k][2] if k in d2 else [0.0] * 5)
+        if any(c1) or any(c2):
+            items.append((src[0], src[1], c1, c2))
+    def key(t):
+        if sort < 0:
+            return t[0].lower()
+        a, b = hq_metrics(t[2], recv)[sort], hq_metrics(t[3], recv)[sort]
+        return (a, b, b - a)[on]
+
+    items.sort(key=key, reverse=desc)
+
+    def line(sno, name, par, c1, c2):
+        row = [sno, name] + par
+        for x, y in zip(hq_metrics(c1, recv), hq_metrics(c2, recv)):
+            row += [x, y, y - x]
+        return row
+
+    npar = len(LEVEL_PARENTS[level])
+    table = [line(i + 1, *it) for i, it in enumerate(items)]
+    table.append(line("", "Total", [""] * npar, [sum(t[2][k] for t in items) for k in range(5)],
+                      [sum(t[3][k] for t in items) for k in range(5)]))
+    return ["S.No.", f"Name of the {level}"] + LEVEL_PARENTS[level], table
+
+
+def cell_put(ws, r, col, v, fill=None, bold=False, fmt=None, color=None):
+    c = ws.cell(r, col, v)
+    c.border, c.font = BOX, Font(name="Calibri", bold=bold, color=color)
+    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    if fill:
+        c.fill = fill
+    if fmt:
+        c.number_format = fmt
+    return c
+
+
+def write_trio(ws, r0, title, name_heads, groups, table):
+    npar = len(name_heads)
+    ncols = npar + 3 * len(groups)
+    for col in range(1, ncols + 1):
+        cell_put(ws, r0, col, title if col == 1 else None, GREEN, True)
+    ws.merge_cells(start_row=r0, start_column=1, end_row=r0, end_column=ncols)
+    for j, h in enumerate(name_heads):
+        cell_put(ws, r0 + 1, j + 1, h, None, True)
+        cell_put(ws, r0 + 2, j + 1, None)
+        ws.merge_cells(start_row=r0 + 1, start_column=j + 1, end_row=r0 + 2, end_column=j + 1)
+    for g, h in enumerate(groups):
+        c0 = npar + 1 + 3 * g
+        for k, (lab, fill) in enumerate((("1st Period", BLUE), ("2nd Period", CREAM), ("Comparison", GREY))):
+            cell_put(ws, r0 + 1, c0 + k, h if k == 0 else None, None, True)
+            cell_put(ws, r0 + 2, c0 + k, lab, fill, True)
+        ws.merge_cells(start_row=r0 + 1, start_column=c0, end_row=r0 + 1, end_column=c0 + 2)
+    for k, row in enumerate(table):
+        last = k == len(table) - 1
+        for j, v in enumerate(row):
+            fill = YELLOW if last else None
+            fmt = color = None
+            if j >= npar:
+                g, pos = divmod(j - npar, 3)
+                fmt = TRIO_FMT[j - npar]
+                if not last:
+                    fill = BLUE if pos == 0 else CREAM if pos == 1 else None
+                if pos == 2 and DIRN[g] and abs(v) > 1e-9:
+                    fill, color = (GOOD, "006100") if v * DIRN[g] > 0 else (BAD, "9C0006")
+            c = cell_put(ws, r0 + 3 + k, j + 1, v, fill, last, fmt, color)
+            if 0 < j < npar:
+                c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[r0 + 1].height = 64
+    ws.row_dimensions[r0 + 2].height = 20
+
+
+def make_hq_comparison(jobs, levels, bases, p1, p2, sort=11, desc=False, on=1):
+    """jobs = [(sheet, report name, all1, bo1, all2, bo2, file level rank)]; p1/p2 = (from, to) dates."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    previews, notes = {}, []
+    need = {"Division": 0, "Sub Division": 1, "Office": 2}
+    label = {"Division": "any export", "Sub Division": "a Sub Division Level or Office Level export",
+             "Office": "an Office Level export"}
+    per = (f"1st Period {p1[0]:%d.%m.%Y} to {p1[1]:%d.%m.%Y} vs "
+           f"2nd Period {p2[0]:%d.%m.%Y} to {p2[1]:%d.%m.%Y}")
+    for sheet, rname, a1, b1, a2, b2, rank in jobs:
+        if bool(b1) != bool(b2):
+            notes.append(f"{rname}: BOs file given for one period only - BOs / Excluding BOs tables skipped.")
+        for level in levels:
+            if need[level] > rank:
+                notes.append(f"{rname}: {level}-wise report skipped - it needs {label[level]}.")
+                continue
+            s1, s2 = dict(hq_scopes(a1, b1, level)), dict(hq_scopes(a2, b2, level))
+            scopes = [n for n in s1 if n in s2]
+            for recv in bases:
+                groups = trio_heads("On received" if recv else "On invoiced")
+                name = (sheet + (f" - {LEVEL_SHORT[level]}" if len(levels) > 1 else "")
+                        + ((" (Rcvd)" if recv else " (Inv)") if len(bases) > 1 else ""))[:31]
+                ws, r0, blocks = wb.create_sheet(name), 1, []
+                for sc in scopes:
+                    title = f"Delivery Transit Analysis {rname}- {LEVEL_TITLE[level]}{sc} - {per}"
+                    nh, table = trio_table(level, s1[sc], s2[sc], recv, sort, desc, on)
+                    write_trio(ws, r0, title, nh, groups, table)
+                    r0 += len(table) + 4
+                    cols = nh + [f"{g.replace(chr(10), ' ')} - {lab}" for g in groups
+                                 for lab in ("1st Period", "2nd Period", "Comparison")]
+                    blocks.append((title, pd.DataFrame(table, columns=cols), [None] * len(nh) + TRIO_FMT))
+                ws.column_dimensions["A"].width, ws.column_dimensions["B"].width = 7, 34
+                npar = len(LEVEL_PARENTS[level])
+                for col in range(3, 3 + npar):
+                    ws.column_dimensions[L(col)].width = 30
+                for col in range(3 + npar, 3 + npar + 36):
+                    ws.column_dimensions[L(col)].width = 13
+                ws.freeze_panes = "C1"
+                previews[ws.title] = blocks
+    if not previews:
+        raise ValueError(" ".join(notes) or "Nothing to compare.")
     return to_bytes(wb), previews, notes
 
 
@@ -706,6 +865,8 @@ def page_hq(st):
     sb.header("Report Options")
     base = sb.radio("Percentages based on", ["Received", "Invoiced", "Both (two sets of sheets)"], key="hq_base")
     lv = sb.multiselect("Report level", list(LEVELS), default=["Division-wise"], key="hq_lv")
+    sort_by = sb.selectbox("Sort by", list(SORT_OPTIONS), list(SORT_OPTIONS).index(SORT_DEFAULT), key="hq_sort")
+    order = sb.radio("Order", ORDERS, key="hq_order")
     sb.divider()
     sb.header("Upload Report Files")
     sb.caption("Upload the export from the portal at any level. **Office Level** gives Division, Sub Division "
@@ -748,7 +909,8 @@ def page_hq(st):
         return
     bases = {"Received": [True], "Invoiced": [False]}.get(base, [True, False])
     try:
-        data, previews, notes = make_hq_reports(jobs, [LEVELS[k] for k in LEVELS if k in lv], bases, d1, d2)
+        data, previews, notes = make_hq_reports(jobs, [LEVELS[k] for k in LEVELS if k in lv], bases, d1, d2,
+                                                   SORT_OPTIONS[sort_by], order == ORDERS[1])
     except Exception as e:
         st.error(f"Could not make the report: {e}")
         return
@@ -760,6 +922,93 @@ def page_hq(st):
         for title, df, fm in blocks:
             tab.subheader(title)
             fmt = {c: "{:.2%}" if f == "0.00%" else "{:,.0f}" for c, f in zip(df.columns, fm) if f}
+            tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
+
+
+def hq_uploaders(sb, prefix, label):
+    """Same three upload sections as the HQ page, inside an expander. Returns {key: uploaded file}."""
+    ex = sb.expander(label, expanded=False)
+    up = lambda lab, key: ex.file_uploader(lab, type=["csv", "xlsx"], key=f"{prefix}_{key}")
+    ex.subheader("1️⃣ All Products")
+    f = {"ap_all": up("All Offices file", "ap_all"), "ap_bo": up("BOs file (optional)", "ap_bo")}
+    ex.subheader("2️⃣ Speed Post Document (Speed Letter)")
+    f.update(sl_all=up("All Offices file", "sl_all"), sl_bo=up("BOs file (optional)", "sl_bo"))
+    ex.subheader("3️⃣ Consolidated Parcels")
+    f.update(sp_all=up("Speed Parcel - All Offices", "sp_all"), rp_all=up("Regd. Parcel - All Offices", "rp_all"),
+             sp_bo=up("Speed Parcel - BOs (optional)", "sp_bo"), rp_bo=up("Regd. Parcel - BOs (optional)", "rp_bo"))
+    return f
+
+
+def page_hq_compare(st):
+    sb = st.sidebar
+    today = datetime.date.today()
+    last_prev = today.replace(day=1) - datetime.timedelta(days=1)
+    sb.divider()
+    sb.header("Periods")
+    sb.subheader("1st Period")
+    c1, c2 = sb.columns(2)
+    a1 = c1.date_input("From", last_prev.replace(day=1), key="hc_a1")
+    b1 = c2.date_input("To", last_prev, key="hc_b1")
+    sb.subheader("2nd Period")
+    c3, c4 = sb.columns(2)
+    a2 = c3.date_input("From", today.replace(day=1), key="hc_a2")
+    b2 = c4.date_input("To", today, key="hc_b2")
+    sb.divider()
+    sb.header("Report Options")
+    base = sb.radio("Percentages based on", ["Received", "Invoiced", "Both (two sets of sheets)"], key="hc_base")
+    lv = sb.multiselect("Report level", list(LEVELS), default=["Division-wise"], key="hc_lv")
+    sort_by = sb.selectbox("Sort by", list(SORT_OPTIONS), list(SORT_OPTIONS).index(SORT_DEFAULT), key="hc_sort")
+    order = sb.radio("Order", ORDERS, key="hc_order")
+    sort_on = sb.radio("Sort using", ["1st Period", "2nd Period", "Comparison"], index=1, key="hc_on")
+    sb.divider()
+    sb.header("Upload Report Files")
+    sb.caption("Open each period below and upload its files (Division, Sub Division or Office Level export).")
+    f1 = hq_uploaders(sb, "hc1", "1st Period files")
+    f2 = hq_uploaders(sb, "hc2", "2nd Period files")
+
+    st.title("HQ D+0 Comparison - Two Periods")
+    st.info("Upload the raw files of the **1st Period** and the **2nd Period** from the sidebar. Every column "
+            "is shown as **1st Period | 2nd Period | Comparison** (2nd minus 1st). Green = better, "
+            "red = worse for the % columns.")
+    if not lv:
+        st.warning("Select at least one report level in the sidebar.")
+        return
+    jobs = []
+    try:
+        for sheet, rname, ak, bk, need in HQ_GROUPS:
+            p = [[f1[k] for k in ks if f1[k]] for ks in (ak, bk)]
+            q = [[f2[k] for k in ks if f2[k]] for ks in (ak, bk)]
+            if not p[0] and not q[0]:
+                continue
+            if not p[0] or not q[0]:
+                st.warning(f"{rname}: All Offices files are needed for both periods - skipped.")
+                continue
+            if len(p[0]) < need or len(q[0]) < need:
+                st.warning(f"{rname}: only some of the files were uploaded, so the figures are incomplete.")
+            r = [[read_hq(f) for f in fl] for fl in (p[0], p[1], q[0], q[1])]
+            jobs.append((sheet, rname, *[[x[0] for x in grp] for grp in r],
+                         min(x[1] for grp in r for x in grp)))
+    except Exception as e:
+        st.error(f"Could not read the files: {e}")
+        return
+    if not jobs:
+        return
+    bases = {"Received": [True], "Invoiced": [False]}.get(base, [True, False])
+    try:
+        data, previews, notes = make_hq_comparison(jobs, [LEVELS[k] for k in LEVELS if k in lv], bases,
+                                                   (a1, b1), (a2, b2), SORT_OPTIONS[sort_by],
+                                                   order == ORDERS[1],
+                                                   ["1st Period", "2nd Period", "Comparison"].index(sort_on))
+    except Exception as e:
+        st.error(f"Could not make the comparison: {e}")
+        return
+    for n in notes:
+        st.warning(n)
+    st.download_button("Download HQ D+0 Comparison (Excel)", data, "HQ_D0_Comparison.xlsx", XLSX, type="primary")
+    for tab, blocks in zip(st.tabs(list(previews)), previews.values()):
+        for title, df, fm in blocks:
+            tab.subheader(title)
+            fmt = {c: FMT_PY[f] for c, f in zip(df.columns, fm) if f}
             tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
 
 
@@ -792,7 +1041,7 @@ def main():
     st.set_page_config(page_title="D+0 Analytics", layout="wide")
     if not login(st):
         return
-    pages = {"Region wise D+0 Reports": page_generate, "HQ D+0 Reports": page_hq,
+    pages = {"Region wise D+0 Reports": page_generate, "HQ D+0 Reports": page_hq, "HQ D+0 Comparison": page_hq_compare,
              "Generate NDC / DC Reports": page_ndc_dc,
              "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare}
     pages[st.sidebar.radio("Select", list(pages))](st)
