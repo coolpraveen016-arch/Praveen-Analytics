@@ -584,8 +584,8 @@ def main():
     st.set_page_config(page_title="D+0 Analytics", layout="wide")
     if not login(st):
         return
-    pages = {"Generate D+0 Reports": page_generate, "Generate NDC / DC Reports": page_ndc_dc,
-             "Day-wise DC Comparison": page_day, "Compare Two Periods": page_compare}
+    pages = {"Region wise D+0 Reports": page_generate, "Generate NDC / DC Reports": page_ndc_dc,
+             "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare}
     pages[st.sidebar.radio("Select", list(pages))](st)
 
 
