@@ -294,6 +294,129 @@ def day_workbook(title, d1, d2, rows, total):
     return to_bytes(wb)
 
 
+# ---------- 1d) HQ D+0 reports (Division / Sub Division / Office level, from Office Level exports) ----------
+LEVELS = {"Division-wise": "Division", "Sub Division-wise": "Sub Division", "Office-wise": "Office"}
+LEVEL_PARENTS = {"Division": [], "Sub Division": ["Division"], "Office": ["Division", "Sub Division"]}
+LEVEL_SHORT = {"Division": "Div", "Sub Division": "Sub Div", "Office": "Office"}
+LEVEL_TITLE = {"Division": "", "Sub Division": "Sub Division wise - ", "Office": "Office wise - "}
+HQ_FMT = ["#,##0", "#,##0", "0.00%", "#,##0", "0.00%", "#,##0", "0.00%", "#,##0", "0.00%", "0.00%", "#,##0", "0.00%"]
+
+
+def clean(x):
+    return " ".join(str(x).split()) if pd.notna(x) else ""
+
+
+def read_hq(f):
+    """Office Level export -> list of {id, div, sub, name, c=[5 counts]}."""
+    data = io.BytesIO(f.getvalue())
+    df = pd.read_csv(data) if f.name.lower().endswith(".csv") else pd.read_excel(data)
+    miss = [c for c in ["Division Name", "Sub Division Name", "Office Name"] + RAW_COLS[1:] if c not in df.columns]
+    if miss:
+        raise ValueError(f"{f.name}: these columns are missing: {', '.join(miss)}. "
+                         "Please upload the Office Level export (Aggregation Level = Office Level).")
+    if (df["Office Name"] == df["Division Name"]).all() or (df["Office Name"] == df["Sub Division Name"]).all():
+        raise ValueError(f"{f.name} is a Division / Sub Division level export. Please upload the Office Level export.")
+    for c in RAW_COLS[1:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    rows = []
+    for i, r in enumerate(df.to_dict("records")):
+        div, sub, name = clean(r["Division Name"]), clean(r["Sub Division Name"]), clean(r["Office Name"])
+        oid = str(r["office_id"]) if "office_id" in r and pd.notna(r["office_id"]) else f"{div}|{sub}|{name}|{i}"
+        rows.append({"id": oid, "div": div, "sub": sub, "name": name, "c": [float(r[c]) for c in RAW_COLS[1:]]})
+    return rows
+
+
+def hq_aggregate(rows, level):
+    """-> {key: [display name, [parent names], counts]}"""
+    out = {}
+    for r in rows:
+        if level == "Division":
+            key, name, par = r["div"], r["div"], []
+        elif level == "Sub Division":
+            sub = r["sub"] or f"{r['div']} (no sub division)"
+            key, name, par = (r["div"], sub), sub, [r["div"]]
+        else:
+            key, name, par = r["id"], r["name"], [r["div"], r["sub"]]
+        if key in out:
+            out[key][2] = [a + b for a, b in zip(out[key][2], r["c"])]
+        else:
+            out[key] = [name, par, list(r["c"])]
+    return out
+
+
+def hq_add(ds):
+    out = {}
+    for d in ds:
+        for k, v in d.items():
+            if k in out:
+                out[k][2] = [a + b for a, b in zip(out[k][2], v[2])]
+            else:
+                out[k] = [v[0], v[1], list(v[2])]
+    return out
+
+
+def hq_sub(a, b):
+    out = {k: [v[0], v[1], [x - y for x, y in zip(v[2], b[k][2] if k in b else [0.0] * 5)]] for k, v in a.items()}
+    for k, v in b.items():
+        if k not in a:
+            out[k] = [v[0], v[1], [-x for x in v[2]]]
+    return out
+
+
+def hq_block(title, level, d, recv):
+    """One table. recv=True -> all % on Received, False -> all % on Invoiced. Sorted by Return+Redirection %."""
+    on = "On received" if recv else "On invoiced"
+    den = (lambda c: c[0]) if recv else (lambda c: c[1])
+    items = [v for v in d.values() if any(v[2])]
+    items.sort(key=lambda v: sd(v[2][3] + v[2][4], den(v[2])))
+    npar = len(LEVEL_PARENTS[level])
+
+    def line(sno, name, par, c):
+        dn, rr = den(c), c[3] + c[4]
+        return ([sno, name] + par + [c[0], c[1], sd(c[1], c[0]), c[2], sd(c[2], dn), c[3], sd(c[3], dn),
+                c[4], sd(c[4], dn), sd(c[2] + rr, dn), rr, sd(rr, dn)])
+
+    table = [line(i + 1, v[0], v[1], v[2]) for i, v in enumerate(items)]
+    table.append(line("", "Total", [""] * npar, [sum(v[2][k] for v in items) for k in range(5)]))
+    heads = (["S.No.", f"Name of the {level}"] + LEVEL_PARENTS[level] +
+             ["Received", "Invoiced", "Invoiced %", "D+0 Delivered", f"D+0 Delivered %\n({on})",
+              "D+0 Redirected", f"D+0 Redirected %\n({on})", "D+0 Returned", f"D+0 Returned %\n({on})",
+              f"D+0 (Delivered+Returned+Redirected) \n({on})", "Return + Redirection", "Return + Redirection\n%"])
+    return title, heads, table, [None] * (2 + npar) + HQ_FMT
+
+
+def make_hq_reports(jobs, levels, bases, d1, d2):
+    """jobs = [(sheet, report name, [All Offices row-lists], [BO row-lists])]; bases = [True (received), False (invoiced)]."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    previews = {}
+    for sheet, rname, all_f, bo_f in jobs:
+        for level in levels:
+            a = hq_add([hq_aggregate(r, level) for r in all_f])
+            scopes = [("All Offices", a)]
+            if bo_f:
+                b = hq_add([hq_aggregate(r, level) for r in bo_f])
+                scopes += [("BOs", b), ("Excluding BOs", hq_sub(a, b))]
+            for recv in bases:
+                blocks = [hq_block(f"Delivery Transit Analysis {rname}- {LEVEL_TITLE[level]}{sc} "
+                                   f"-{d1:%d.%m.%Y} to {d2:%d.%m.%Y}", level, d, recv) for sc, d in scopes]
+                name = (sheet + (f" - {LEVEL_SHORT[level]}" if len(levels) > 1 else "")
+                        + ((" (Rcvd)" if recv else " (Inv)") if len(bases) > 1 else ""))[:31]
+                ws, r0, npar = wb.create_sheet(name), 1, len(LEVEL_PARENTS[level])
+                for title, heads, table, fmts in blocks:
+                    write_block(ws, 1, title, heads, table, fmts, r0)
+                    r0 += len(table) + 3
+                ws.column_dimensions["A"].width, ws.column_dimensions["B"].width = 7, 34
+                for col in range(3, 3 + npar):
+                    ws.column_dimensions[L(col)].width = 30
+                for col in range(3 + npar, 15 + npar):
+                    ws.column_dimensions[L(col)].width = 14
+                ws.freeze_panes = "C1"
+                previews[ws.title] = [(t, pd.DataFrame(tb, columns=[h.replace("\n", " ") for h in hd]), fm)
+                                      for t, hd, tb, fm in blocks]
+    return to_bytes(wb), previews
+
+
 # ---------- 2) Compare two report files ----------
 def parse_block(raw, hdr, name_col):
     roles = {}
@@ -555,6 +678,67 @@ def page_day(st):
         tab.dataframe(pd.DataFrame(table, columns=cols).style.format(fmt), hide_index=True, use_container_width=True)
 
 
+def page_hq(st):
+    sb = st.sidebar
+    sb.divider()
+    sb.header("Report Period")
+    c1, c2 = sb.columns(2)
+    today = datetime.date.today()
+    d1 = c1.date_input("From", today.replace(day=1), key="hq_d1")
+    d2 = c2.date_input("To", today, key="hq_d2")
+    sb.divider()
+    sb.header("Report Options")
+    base = sb.radio("Percentages based on", ["Received", "Invoiced", "Both (two sets of sheets)"], key="hq_base")
+    lv = sb.multiselect("Report level", list(LEVELS), default=["Division-wise"], key="hq_lv")
+    sb.divider()
+    sb.header("Upload Report Files")
+    sb.caption("Upload the **Office Level** export (Aggregation Level = Office Level). "
+               "Division and Sub Division totals are calculated automatically.")
+    up = lambda label, key: sb.file_uploader(label, type=["csv", "xlsx"], key=key)
+    sb.subheader("1️⃣ All Products")
+    ap_all, ap_bo = up("All Offices file", "hq_ap_all"), up("BOs file (optional)", "hq_ap_bo")
+    sb.subheader("2️⃣ Speed Post Document (Speed Letter)")
+    sl_all, sl_bo = up("All Offices file", "hq_sl_all"), up("BOs file (optional)", "hq_sl_bo")
+    sb.subheader("3️⃣ Consolidated Parcels (Speed Parcel + Regd. Parcel)")
+    sp_all, rp_all = up("Speed Parcel - All Offices", "hq_sp_all"), up("Regd. Parcel - All Offices", "hq_rp_all")
+    sp_bo, rp_bo = up("Speed Parcel - BOs (optional)", "hq_sp_bo"), up("Regd. Parcel - BOs (optional)", "hq_rp_bo")
+
+    st.title("HQ Delivery Transit Analysis (D+0)")
+    st.info("Upload the Office Level raw files from the sidebar. Choose whether all % are worked out on "
+            "**Received** or on **Invoiced** (or get both), and which levels you want "
+            "(Division / Sub Division / Office). With a BOs file you also get the BOs and Excluding-BOs tables; "
+            "Excluding-BOs = All Offices - BOs.")
+    if not lv:
+        st.warning("Select at least one report level in the sidebar.")
+        return
+    groups = [("All Products", "All Products", [ap_all], [ap_bo], 1),
+              ("Speed Letter", "Speed Post Document", [sl_all], [sl_bo], 1),
+              ("Parcels", "Consolidated Parcels", [sp_all, rp_all], [sp_bo, rp_bo], 2)]
+    jobs = []
+    try:
+        for sheet, rname, alls, bos, need in groups:
+            alls, bos = [f for f in alls if f], [f for f in bos if f]
+            if not alls:
+                continue
+            if len(alls) < need or (bos and len(bos) < need):
+                st.warning(f"{rname}: only some of the files were uploaded, so the figures are incomplete.")
+            jobs.append((sheet, rname, [read_hq(f) for f in alls], [read_hq(f) for f in bos]))
+    except Exception as e:
+        st.error(f"Could not read the files: {e}")
+        return
+    if not jobs:
+        return
+    bases = {"Received": [True], "Invoiced": [False]}.get(base, [True, False])
+    data, previews = make_hq_reports(jobs, [LEVELS[k] for k in LEVELS if k in lv], bases, d1, d2)
+    st.download_button("Download HQ D+0 Reports (Master Excel Workbook)", data, "HQ_D0_Reports.xlsx", XLSX,
+                       type="primary")
+    for tab, blocks in zip(st.tabs(list(previews)), previews.values()):
+        for title, df, fm in blocks:
+            tab.subheader(title)
+            fmt = {c: "{:.2%}" if f == "0.00%" else "{:,.0f}" for c, f in zip(df.columns, fm) if f}
+            tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
+
+
 def page_compare(st):
     st.title("Delivery Transit Analysis (D+0) - Period Comparison")
     st.info("Upload the two report Excel files you want to compare (reports made by this app, or the "
@@ -584,7 +768,8 @@ def main():
     st.set_page_config(page_title="D+0 Analytics", layout="wide")
     if not login(st):
         return
-    pages = {"Region wise D+0 Reports": page_generate, "Generate NDC / DC Reports": page_ndc_dc,
+    pages = {"Region wise D+0 Reports": page_generate, "HQ D+0 Reports": page_hq,
+             "Generate NDC / DC Reports": page_ndc_dc,
              "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare}
     pages[st.sidebar.radio("Select", list(pages))](st)
 
