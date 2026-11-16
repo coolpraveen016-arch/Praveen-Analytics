@@ -398,11 +398,18 @@ def hq_block(title, level, d, recv, sort=11, desc=False):
     return title, heads, table, [None] * (2 + npar) + HQ_FMT
 
 
-def make_hq_reports(jobs, levels, bases, d1, d2, sort=11, desc=False):
-    """jobs = [(sheet, report name, [All Offices row-lists], [BO row-lists], file level rank 0/1/2)];
-    bases = [True (received), False (invoiced)]. Returns (bytes, previews, notes)."""
-    wb = Workbook()
-    wb.remove(wb.active)
+def hq_sheet_name(base, level, recv, multi_level, both):
+    lv = f" - {LEVEL_SHORT[level]}" if multi_level else ""
+    bs = (" (Rcvd)" if recv else " (Inv)") if both else ""
+    if len(base + lv + bs) > 31:                                   # Excel allows 31 characters only
+        lv = f" - {LEVEL_SHORT[level].replace(' ', '')}" if multi_level else ""
+        bs = (" (R)" if recv else " (I)") if both else ""
+    return (base + lv + bs)[:31]
+
+
+def add_hq_report_sheets(wb, jobs, levels, bases, period, sort=11, desc=False, tag=""):
+    """Writes HQ report sheets into wb. jobs = [(sheet, report name, [All Offices row-lists], [BO row-lists],
+    file level rank 0/1/2)]; bases = [True (received), False (invoiced)]. Returns (previews, notes)."""
     previews, notes = {}, []
     need = {"Division": 0, "Sub Division": 1, "Office": 2}
     label = {"Division": "any export", "Sub Division": "a Sub Division Level or Office Level export",
@@ -418,10 +425,9 @@ def make_hq_reports(jobs, levels, bases, d1, d2, sort=11, desc=False):
                 b = hq_add([hq_aggregate(r, level) for r in bo_f])
                 scopes += [("BOs", b), ("Excluding BOs", hq_sub(a, b))]
             for recv in bases:
-                blocks = [hq_block(f"Delivery Transit Analysis {rname}- {LEVEL_TITLE[level]}{sc} "
-                                   f"-{d1:%d.%m.%Y} to {d2:%d.%m.%Y}", level, d, recv, sort, desc) for sc, d in scopes]
-                name = (sheet + (f" - {LEVEL_SHORT[level]}" if len(levels) > 1 else "")
-                        + ((" (Rcvd)" if recv else " (Inv)") if len(bases) > 1 else ""))[:31]
+                blocks = [hq_block(f"Delivery Transit Analysis {rname}- {LEVEL_TITLE[level]}{sc} -{period}",
+                                   level, d, recv, sort, desc) for sc, d in scopes]
+                name = hq_sheet_name(sheet + tag, level, recv, len(levels) > 1, len(bases) > 1)
                 ws, r0, npar = wb.create_sheet(name), 1, len(LEVEL_PARENTS[level])
                 for title, heads, table, fmts in blocks:
                     write_block(ws, 1, title, heads, table, fmts, r0)
@@ -434,9 +440,22 @@ def make_hq_reports(jobs, levels, bases, d1, d2, sort=11, desc=False):
                 ws.freeze_panes = "C1"
                 previews[ws.title] = [(t, pd.DataFrame(tb, columns=[h.replace("\n", " ") for h in hd]), fm)
                                       for t, hd, tb, fm in blocks]
+    return previews, notes
+
+
+def make_hq_reports(jobs, levels, bases, d1, d2, sort=11, desc=False):
+    wb = Workbook()
+    wb.remove(wb.active)
+    previews, notes = add_hq_report_sheets(wb, jobs, levels, bases, f"{d1:%d.%m.%Y} to {d2:%d.%m.%Y}", sort, desc)
     if not previews:
         raise ValueError(" ".join(notes) or "Nothing to make.")
     return to_bytes(wb), previews, notes
+
+
+def period_text(p1, p2):
+    if (p2[0] - p1[1]).days == 1:                                  # back-to-back periods -> one range
+        return f"{p1[0]:%d.%m.%Y} to {p2[1]:%d.%m.%Y}"
+    return f"{p1[0]:%d.%m.%Y} to {p1[1]:%d.%m.%Y} + {p2[0]:%d.%m.%Y} to {p2[1]:%d.%m.%Y}"
 
 
 # ---------- 1e) HQ D+0 comparison: every column as 1st Period | 2nd Period | Comparison ----------
@@ -547,7 +566,7 @@ def write_trio(ws, r0, title, name_heads, groups, table):
     ws.row_dimensions[r0 + 2].height = 20
 
 
-def make_hq_comparison(jobs, levels, bases, p1, p2, sort=11, desc=False, on=1):
+def make_hq_comparison(jobs, levels, bases, p1, p2, sort=11, desc=False, on=1, totals=True):
     """jobs = [(sheet, report name, all1, bo1, all2, bo2, file level rank)]; p1/p2 = (from, to) dates."""
     wb = Workbook()
     wb.remove(wb.active)
@@ -568,8 +587,7 @@ def make_hq_comparison(jobs, levels, bases, p1, p2, sort=11, desc=False, on=1):
             scopes = [n for n in s1 if n in s2]
             for recv in bases:
                 groups = trio_heads("On received" if recv else "On invoiced")
-                name = (sheet + (f" - {LEVEL_SHORT[level]}" if len(levels) > 1 else "")
-                        + ((" (Rcvd)" if recv else " (Inv)") if len(bases) > 1 else ""))[:31]
+                name = hq_sheet_name(sheet, level, recv, len(levels) > 1, len(bases) > 1)
                 ws, r0, blocks = wb.create_sheet(name), 1, []
                 for sc in scopes:
                     title = f"Delivery Transit Analysis {rname}- {LEVEL_TITLE[level]}{sc} - {per}"
@@ -587,6 +605,11 @@ def make_hq_comparison(jobs, levels, bases, p1, p2, sort=11, desc=False, on=1):
                     ws.column_dimensions[L(col)].width = 13
                 ws.freeze_panes = "C1"
                 previews[ws.title] = blocks
+    if totals and previews:
+        tjobs = [(sh, rn, x1 + x2, (y1 + y2) if (y1 and y2) else [], rk) for sh, rn, x1, y1, x2, y2, rk in jobs]
+        tp, tn = add_hq_report_sheets(wb, tjobs, levels, bases, period_text(p1, p2), sort, desc, " Total")
+        previews.update(tp)
+        notes += [n for n in tn if n not in notes]
     if not previews:
         raise ValueError(" ".join(notes) or "Nothing to compare.")
     return to_bytes(wb), previews, notes
@@ -903,6 +926,8 @@ def page_hq(st):
     order = sb.radio("Order", ORDERS, key="hq_order")
     sort_on = sb.radio("Sort using (when comparing)", ["1st Period", "2nd Period", "Comparison"], index=1,
                        key="hq_on")
+    totals = sb.checkbox("When comparing, also add sheets with Period 1 + Period 2 added together (Total)",
+                         value=True, key="hq_total")
     sb.divider()
     sb.header("Upload Report Files")
     sb.caption("Upload the export from the portal at any level. **Office Level** gives Division, Sub Division "
@@ -914,7 +939,8 @@ def page_hq(st):
     st.title("HQ Delivery Transit Analysis (D+0)")
     st.info("Upload the raw files of **Period 1** from the sidebar to get the D+0 report. Add the files of "
             "**Period 2** as well and every column is shown as **1st Period | 2nd Period | Comparison** "
-            "(2nd minus 1st; green = better, red = worse for the % columns). With a BOs file you also get the "
+            "(2nd minus 1st; green = better, red = worse for the % columns), plus **Total** sheets with the two "
+            "periods added together. With a BOs file you also get the "
             "BOs and Excluding-BOs tables; Excluding-BOs = All Offices - BOs.")
     if not lv:
         st.warning("Select at least one report level in the sidebar.")
@@ -939,7 +965,8 @@ def page_hq(st):
                 elif sheet in p1 or sheet in p2:
                     st.warning(f"{rname}: files are needed for both periods - skipped.")
             data, previews, notes = make_hq_comparison(jobs, levels, bases, (a1, b1), (a2, b2), sort, desc,
-                                                       ["1st Period", "2nd Period", "Comparison"].index(sort_on))
+                                                       ["1st Period", "2nd Period", "Comparison"].index(sort_on),
+                                                       totals)
             label, fname = "Download HQ D+0 Comparison (Master Excel Workbook)", "HQ_D0_Comparison.xlsx"
         else:
             pr, (d1, d2) = (p1, (a1, b1)) if p1 else (p2, (a2, b2))
