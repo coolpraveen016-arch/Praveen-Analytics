@@ -853,158 +853,105 @@ def page_day(st):
         tab.dataframe(pd.DataFrame(table, columns=cols).style.format(fmt), hide_index=True, use_container_width=True)
 
 
+def hq_uploaders(sb, prefix, label, expanded=False):
+    """The three upload sections (All Products / Speed Letter / Parcels) inside an expander."""
+    ex = sb.expander(label, expanded=expanded)
+    up = lambda lab, key: ex.file_uploader(lab, type=["csv", "xlsx"], key=f"{prefix}_{key}")
+    ex.subheader("1️⃣ All Products")
+    f = {"ap_all": up("All Offices file", "ap_all"), "ap_bo": up("BOs file (optional)", "ap_bo")}
+    ex.subheader("2️⃣ Speed Post Document (Speed Letter)")
+    f.update(sl_all=up("All Offices file", "sl_all"), sl_bo=up("BOs file (optional)", "sl_bo"))
+    ex.subheader("3️⃣ Consolidated Parcels (Speed Parcel + Regd. Parcel)")
+    f.update(sp_all=up("Speed Parcel - All Offices", "sp_all"), rp_all=up("Regd. Parcel - All Offices", "rp_all"),
+             sp_bo=up("Speed Parcel - BOs (optional)", "sp_bo"), rp_bo=up("Regd. Parcel - BOs (optional)", "rp_bo"))
+    return f
+
+
+def hq_read_period(st, f, tag):
+    """Uploaded files of one period -> {sheet: (report name, [All rows], [BO rows], level rank)}."""
+    out = {}
+    for sheet, rname, ak, bk, need in HQ_GROUPS:
+        alls, bos = [f[k] for k in ak if f[k]], [f[k] for k in bk if f[k]]
+        if not alls:
+            continue
+        if len(alls) < need or (bos and len(bos) < need):
+            st.warning(f"{tag} - {rname}: only some of the files were uploaded, so the figures are incomplete.")
+        ra, rb = [read_hq(x) for x in alls], [read_hq(x) for x in bos]
+        out[sheet] = (rname, [x[0] for x in ra], [x[0] for x in rb], min(x[1] for x in ra + rb))
+    return out
+
+
 def page_hq(st):
     sb = st.sidebar
-    sb.divider()
-    sb.header("Report Period")
-    c1, c2 = sb.columns(2)
     today = datetime.date.today()
-    d1 = c1.date_input("From", today.replace(day=1), key="hq_d1")
-    d2 = c2.date_input("To", today, key="hq_d2")
+    last_prev = today.replace(day=1) - datetime.timedelta(days=1)
+    sb.divider()
+    sb.header("Period 1")
+    c1, c2 = sb.columns(2)
+    a1 = c1.date_input("From", last_prev.replace(day=1), key="hq_a1")
+    b1 = c2.date_input("To", last_prev, key="hq_b1")
+    sb.header("Period 2 (optional)")
+    sb.caption("Add Period 2 files to get a comparison of the two periods.")
+    c3, c4 = sb.columns(2)
+    a2 = c3.date_input("From", today.replace(day=1), key="hq_a2")
+    b2 = c4.date_input("To", today, key="hq_b2")
     sb.divider()
     sb.header("Report Options")
     base = sb.radio("Percentages based on", ["Received", "Invoiced", "Both (two sets of sheets)"], key="hq_base")
     lv = sb.multiselect("Report level", list(LEVELS), default=["Division-wise"], key="hq_lv")
     sort_by = sb.selectbox("Sort by", list(SORT_OPTIONS), list(SORT_OPTIONS).index(SORT_DEFAULT), key="hq_sort")
     order = sb.radio("Order", ORDERS, key="hq_order")
+    sort_on = sb.radio("Sort using (when comparing)", ["1st Period", "2nd Period", "Comparison"], index=1,
+                       key="hq_on")
     sb.divider()
     sb.header("Upload Report Files")
     sb.caption("Upload the export from the portal at any level. **Office Level** gives Division, Sub Division "
                "and Office wise reports; **Sub Division Level** gives Division and Sub Division wise; "
-               "**Division Level** gives Division wise.")
-    up = lambda label, key: sb.file_uploader(label, type=["csv", "xlsx"], key=key)
-    sb.subheader("1️⃣ All Products")
-    ap_all, ap_bo = up("All Offices file", "hq_ap_all"), up("BOs file (optional)", "hq_ap_bo")
-    sb.subheader("2️⃣ Speed Post Document (Speed Letter)")
-    sl_all, sl_bo = up("All Offices file", "hq_sl_all"), up("BOs file (optional)", "hq_sl_bo")
-    sb.subheader("3️⃣ Consolidated Parcels (Speed Parcel + Regd. Parcel)")
-    sp_all, rp_all = up("Speed Parcel - All Offices", "hq_sp_all"), up("Regd. Parcel - All Offices", "hq_rp_all")
-    sp_bo, rp_bo = up("Speed Parcel - BOs (optional)", "hq_sp_bo"), up("Regd. Parcel - BOs (optional)", "hq_rp_bo")
+               "**Division Level** gives Division wise. Use the same level for both periods.")
+    f1 = hq_uploaders(sb, "hq1", "Period 1 files", True)
+    f2 = hq_uploaders(sb, "hq2", "Period 2 files (optional)")
 
     st.title("HQ Delivery Transit Analysis (D+0)")
-    st.info("Upload the raw files from the sidebar. Choose whether all % are worked out on "
-            "**Received** or on **Invoiced** (or get both), and which levels you want "
-            "(Division / Sub Division / Office). With a BOs file you also get the BOs and Excluding-BOs tables; "
-            "Excluding-BOs = All Offices - BOs.")
+    st.info("Upload the raw files of **Period 1** from the sidebar to get the D+0 report. Add the files of "
+            "**Period 2** as well and every column is shown as **1st Period | 2nd Period | Comparison** "
+            "(2nd minus 1st; green = better, red = worse for the % columns). With a BOs file you also get the "
+            "BOs and Excluding-BOs tables; Excluding-BOs = All Offices - BOs.")
     if not lv:
         st.warning("Select at least one report level in the sidebar.")
         return
-    groups = [("All Products", "All Products", [ap_all], [ap_bo], 1),
-              ("Speed Letter", "Speed Post Document", [sl_all], [sl_bo], 1),
-              ("Parcels", "Consolidated Parcels", [sp_all, rp_all], [sp_bo, rp_bo], 2)]
-    jobs = []
     try:
-        for sheet, rname, alls, bos, need in groups:
-            alls, bos = [f for f in alls if f], [f for f in bos if f]
-            if not alls:
-                continue
-            if len(alls) < need or (bos and len(bos) < need):
-                st.warning(f"{rname}: only some of the files were uploaded, so the figures are incomplete.")
-            ra, rb = [read_hq(f) for f in alls], [read_hq(f) for f in bos]
-            jobs.append((sheet, rname, [x[0] for x in ra], [x[0] for x in rb], min(x[1] for x in ra + rb)))
+        p1, p2 = hq_read_period(st, f1, "Period 1"), hq_read_period(st, f2, "Period 2")
     except Exception as e:
         st.error(f"Could not read the files: {e}")
         return
-    if not jobs:
+    if not p1 and not p2:
         return
+    levels = [LEVELS[k] for k in LEVELS if k in lv]
     bases = {"Received": [True], "Invoiced": [False]}.get(base, [True, False])
+    sort, desc = SORT_OPTIONS[sort_by], order == ORDERS[1]
     try:
-        data, previews, notes = make_hq_reports(jobs, [LEVELS[k] for k in LEVELS if k in lv], bases, d1, d2,
-                                                   SORT_OPTIONS[sort_by], order == ORDERS[1])
+        if p1 and p2:
+            jobs = []
+            for sheet, rname, *_ in HQ_GROUPS:
+                if sheet in p1 and sheet in p2:
+                    x, y = p1[sheet], p2[sheet]
+                    jobs.append((sheet, x[0], x[1], x[2], y[1], y[2], min(x[3], y[3])))
+                elif sheet in p1 or sheet in p2:
+                    st.warning(f"{rname}: files are needed for both periods - skipped.")
+            data, previews, notes = make_hq_comparison(jobs, levels, bases, (a1, b1), (a2, b2), sort, desc,
+                                                       ["1st Period", "2nd Period", "Comparison"].index(sort_on))
+            label, fname = "Download HQ D+0 Comparison (Master Excel Workbook)", "HQ_D0_Comparison.xlsx"
+        else:
+            pr, (d1, d2) = (p1, (a1, b1)) if p1 else (p2, (a2, b2))
+            jobs = [(sheet, v[0], v[1], v[2], v[3]) for sheet, v in pr.items()]
+            data, previews, notes = make_hq_reports(jobs, levels, bases, d1, d2, sort, desc)
+            label, fname = "Download HQ D+0 Reports (Master Excel Workbook)", "HQ_D0_Reports.xlsx"
     except Exception as e:
         st.error(f"Could not make the report: {e}")
         return
     for n in notes:
         st.warning(n)
-    st.download_button("Download HQ D+0 Reports (Master Excel Workbook)", data, "HQ_D0_Reports.xlsx", XLSX,
-                       type="primary")
-    for tab, blocks in zip(st.tabs(list(previews)), previews.values()):
-        for title, df, fm in blocks:
-            tab.subheader(title)
-            fmt = {c: "{:.2%}" if f == "0.00%" else "{:,.0f}" for c, f in zip(df.columns, fm) if f}
-            tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
-
-
-def hq_uploaders(sb, prefix, label):
-    """Same three upload sections as the HQ page, inside an expander. Returns {key: uploaded file}."""
-    ex = sb.expander(label, expanded=False)
-    up = lambda lab, key: ex.file_uploader(lab, type=["csv", "xlsx"], key=f"{prefix}_{key}")
-    ex.subheader("1️⃣ All Products")
-    f = {"ap_all": up("All Offices file", "ap_all"), "ap_bo": up("BOs file (optional)", "ap_bo")}
-    ex.subheader("2️⃣ Speed Post Document (Speed Letter)")
-    f.update(sl_all=up("All Offices file", "sl_all"), sl_bo=up("BOs file (optional)", "sl_bo"))
-    ex.subheader("3️⃣ Consolidated Parcels")
-    f.update(sp_all=up("Speed Parcel - All Offices", "sp_all"), rp_all=up("Regd. Parcel - All Offices", "rp_all"),
-             sp_bo=up("Speed Parcel - BOs (optional)", "sp_bo"), rp_bo=up("Regd. Parcel - BOs (optional)", "rp_bo"))
-    return f
-
-
-def page_hq_compare(st):
-    sb = st.sidebar
-    today = datetime.date.today()
-    last_prev = today.replace(day=1) - datetime.timedelta(days=1)
-    sb.divider()
-    sb.header("Periods")
-    sb.subheader("1st Period")
-    c1, c2 = sb.columns(2)
-    a1 = c1.date_input("From", last_prev.replace(day=1), key="hc_a1")
-    b1 = c2.date_input("To", last_prev, key="hc_b1")
-    sb.subheader("2nd Period")
-    c3, c4 = sb.columns(2)
-    a2 = c3.date_input("From", today.replace(day=1), key="hc_a2")
-    b2 = c4.date_input("To", today, key="hc_b2")
-    sb.divider()
-    sb.header("Report Options")
-    base = sb.radio("Percentages based on", ["Received", "Invoiced", "Both (two sets of sheets)"], key="hc_base")
-    lv = sb.multiselect("Report level", list(LEVELS), default=["Division-wise"], key="hc_lv")
-    sort_by = sb.selectbox("Sort by", list(SORT_OPTIONS), list(SORT_OPTIONS).index(SORT_DEFAULT), key="hc_sort")
-    order = sb.radio("Order", ORDERS, key="hc_order")
-    sort_on = sb.radio("Sort using", ["1st Period", "2nd Period", "Comparison"], index=1, key="hc_on")
-    sb.divider()
-    sb.header("Upload Report Files")
-    sb.caption("Open each period below and upload its files (Division, Sub Division or Office Level export).")
-    f1 = hq_uploaders(sb, "hc1", "1st Period files")
-    f2 = hq_uploaders(sb, "hc2", "2nd Period files")
-
-    st.title("HQ D+0 Comparison - Two Periods")
-    st.info("Upload the raw files of the **1st Period** and the **2nd Period** from the sidebar. Every column "
-            "is shown as **1st Period | 2nd Period | Comparison** (2nd minus 1st). Green = better, "
-            "red = worse for the % columns.")
-    if not lv:
-        st.warning("Select at least one report level in the sidebar.")
-        return
-    jobs = []
-    try:
-        for sheet, rname, ak, bk, need in HQ_GROUPS:
-            p = [[f1[k] for k in ks if f1[k]] for ks in (ak, bk)]
-            q = [[f2[k] for k in ks if f2[k]] for ks in (ak, bk)]
-            if not p[0] and not q[0]:
-                continue
-            if not p[0] or not q[0]:
-                st.warning(f"{rname}: All Offices files are needed for both periods - skipped.")
-                continue
-            if len(p[0]) < need or len(q[0]) < need:
-                st.warning(f"{rname}: only some of the files were uploaded, so the figures are incomplete.")
-            r = [[read_hq(f) for f in fl] for fl in (p[0], p[1], q[0], q[1])]
-            jobs.append((sheet, rname, *[[x[0] for x in grp] for grp in r],
-                         min(x[1] for grp in r for x in grp)))
-    except Exception as e:
-        st.error(f"Could not read the files: {e}")
-        return
-    if not jobs:
-        return
-    bases = {"Received": [True], "Invoiced": [False]}.get(base, [True, False])
-    try:
-        data, previews, notes = make_hq_comparison(jobs, [LEVELS[k] for k in LEVELS if k in lv], bases,
-                                                   (a1, b1), (a2, b2), SORT_OPTIONS[sort_by],
-                                                   order == ORDERS[1],
-                                                   ["1st Period", "2nd Period", "Comparison"].index(sort_on))
-    except Exception as e:
-        st.error(f"Could not make the comparison: {e}")
-        return
-    for n in notes:
-        st.warning(n)
-    st.download_button("Download HQ D+0 Comparison (Excel)", data, "HQ_D0_Comparison.xlsx", XLSX, type="primary")
+    st.download_button(label, data, fname, XLSX, type="primary")
     for tab, blocks in zip(st.tabs(list(previews)), previews.values()):
         for title, df, fm in blocks:
             tab.subheader(title)
@@ -1041,7 +988,7 @@ def main():
     st.set_page_config(page_title="D+0 Analytics", layout="wide")
     if not login(st):
         return
-    pages = {"Region wise D+0 Reports": page_generate, "HQ D+0 Reports": page_hq, "HQ D+0 Comparison": page_hq_compare,
+    pages = {"Region wise D+0 Reports": page_generate, "HQ D+0 Reports": page_hq,
              "Generate NDC / DC Reports": page_ndc_dc,
              "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare}
     pages[st.sidebar.radio("Select", list(pages))](st)
