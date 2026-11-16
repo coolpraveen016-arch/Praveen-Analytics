@@ -614,8 +614,8 @@ def add_hq_comparison_sheets(wb, jobs, levels, bases, labels, per, sort=11, desc
 
 def make_hq_workbook(P, D, levels, bases, sort=11, desc=False, on=1):
     """P = {1: .., 2: .., 3: ..} period data from hq_read_period ({} if none); D = {k: (from, to)}.
-    Sheet groups, in this order: each period's report, Period 1 vs 2 comparison, Period 1 + 2 addition,
-    comparison of the added periods (or Period 1) with Period 3."""
+    Sheet groups, in this order: each period's report, Period 2 vs Period 3 comparison, Period 2 + 3 addition
+    (no comparison), then Period 1 compared with the added periods (or with Period 2 / Period 3 alone)."""
     wb = Workbook()
     wb.remove(wb.active)
     previews, notes = {}, []
@@ -644,27 +644,28 @@ def make_hq_workbook(P, D, levels, bases, sort=11, desc=False, on=1):
         jobs = [(sh, v[0], v[1], v[2], v[3]) for sh, v in P[k].items()]
         keep(add_hq_report_sheets(wb, jobs, levels, bases, txt(D[k]), sort, desc, f"P{k} " if len(have) > 1 else ""))
     added = None
-    if P.get(1) and P.get(2):
-        keep(add_hq_comparison_sheets(wb, cjobs(P[1], P[2], "Period 1 and Period 2"), levels, bases,
-                                      ("Period 1", "Period 2"), f"Period 1 {txt(D[1])} vs Period 2 {txt(D[2])}",
-                                      sort, desc, on, "P1vP2 "))     # 4) Period 1 vs Period 2
+    if P.get(2) and P.get(3):
+        keep(add_hq_comparison_sheets(wb, cjobs(P[2], P[3], "Period 2 and Period 3"), levels, bases,
+                                      ("Period 2", "Period 3"), f"Period 2 {txt(D[2])} vs Period 3 {txt(D[3])}",
+                                      sort, desc, on, "P2vP3 "))     # 4) Period 2 vs Period 3
         added = {}
-        for sh in in_both(P[1], P[2], "Period 1 and Period 2"):      # 5) Period 1 + Period 2
-            x, y = P[1][sh], P[2][sh]
+        for sh in in_both(P[2], P[3], "Period 2 and Period 3"):      # 5) Period 2 + Period 3
+            x, y = P[2][sh], P[3][sh]
             if bool(x[2]) != bool(y[2]):
                 notes.append(f"{x[0]}: BOs file given for one period only - no BOs tables in the addition.")
             added[sh] = (x[0], x[1] + y[1], (x[2] + y[2]) if (x[2] and y[2]) else [], min(x[3], y[3]))
         keep(add_hq_report_sheets(wb, [(sh, *v) for sh, v in added.items()], levels, bases,
-                                  period_text(D[1], D[2]), sort, desc, "P1+P2 "))
-    if P.get(3):                                                     # 6) (Period 1 + 2, or Period 1) vs Period 3
+                                  period_text(D[2], D[3]), sort, desc, "P2+P3 "))
+    if P.get(1):                                                     # 6) Period 1 vs (Period 2 + 3, or 2, or 3)
+        late = None
         if added is not None:
-            early, lab, pre, rng = added, "Period 1+2", "(P1+P2)vP3 ", period_text(D[1], D[2])
-        else:
-            k = 1 if P.get(1) else 2
-            early, lab, pre, rng = P.get(k), f"Period {k}", f"P{k}vP3 ", txt(D[k]) if P.get(k) else ""
-        if early:
-            keep(add_hq_comparison_sheets(wb, cjobs(early, P[3], f"{lab} and Period 3"), levels, bases,
-                                          (lab, "Period 3"), f"{lab} {rng} vs Period 3 {txt(D[3])}",
+            late, lab, pre, rng = added, "Period 2+3", "P1v(P2+P3) ", period_text(D[2], D[3])
+        elif P.get(2) or P.get(3):
+            k = 2 if P.get(2) else 3
+            late, lab, pre, rng = P[k], f"Period {k}", f"P1vP{k} ", txt(D[k])
+        if late:
+            keep(add_hq_comparison_sheets(wb, cjobs(P[1], late, f"Period 1 and {lab}"), levels, bases,
+                                          ("Period 1", lab), f"Period 1 {txt(D[1])} vs {lab} {rng}",
                                           sort, desc, on, pre))
     if not previews:
         raise ValueError(" ".join(notes) or "Nothing to make.")
@@ -967,9 +968,9 @@ def page_hq(st):
     sb.divider()
     dates = {}
     for k, head, cap, d_from, d_to in [
-            (1, "Period 1", "", last_prev.replace(day=1), last_prev),
-            (2, "Period 2 (optional)", "Added to Period 1 before comparing with Period 3.", today.replace(day=1), today),
-            (3, "Period 3", "Compared with Period 1 (or with Period 1 + Period 2 added).", today, today)]:
+            (1, "Period 1", "The base period. Period 2 (+ Period 3) is compared with it.", last_prev.replace(day=1), last_prev),
+            (2, "Period 2", "", today.replace(day=1), today),
+            (3, "Period 3 (optional)", "If given, Period 2 + Period 3 are added together and compared with Period 1.", today, today)]:
         sb.header(head)
         if cap:
             sb.caption(cap)
@@ -989,15 +990,15 @@ def page_hq(st):
                "and Office wise reports; **Sub Division Level** gives Division and Sub Division wise; "
                "**Division Level** gives Division wise. Use the same level for all periods.")
     files = {1: hq_uploaders(sb, "hq1", "Period 1 files", True),
-             2: hq_uploaders(sb, "hq2", "Period 2 files (optional)"),
-             3: hq_uploaders(sb, "hq3", "Period 3 files")}
+             2: hq_uploaders(sb, "hq2", "Period 2 files"),
+             3: hq_uploaders(sb, "hq3", "Period 3 files (optional)")}
 
     st.title("HQ Delivery Transit Analysis (D+0)")
-    st.info("Upload **Period 1** files to get the D+0 report. Add **Period 3** to compare it with Period 1. "
-            "Add **Period 2** as well and Period 1 + Period 2 are added together, and that total is compared "
-            "with Period 3. The Excel has, for each of All Products, Speed Letter and Parcels: every period's "
-            "report, Period 1 vs Period 2, Period 1 + Period 2 (addition only), and the comparison with "
-            "Period 3. Comparison columns show 2nd minus 1st (green = better, red = worse for the % columns).")
+    st.info("Upload **Period 1** files to get the D+0 report. Add **Period 2** and it is compared with Period 1. "
+            "Add **Period 3** as well and Period 2 + Period 3 are added together, and that total is compared "
+            "with Period 1. The Excel has, for each of All Products, Speed Letter and Parcels: every period's "
+            "report, Period 2 vs Period 3, Period 2 + Period 3 (addition only), and the comparison with Period 1. "
+            "Comparison columns show later minus earlier (green = better, red = worse for the % columns).")
     if not lv:
         st.warning("Select at least one report level in the sidebar.")
         return
