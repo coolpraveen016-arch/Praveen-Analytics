@@ -676,11 +676,11 @@ def make_hq_workbook(P, D, levels, bases, sort=11, desc=False, on=1):
 # ---------- 1f) WhatsApp texts for NDCs / DCs / 24 (Speed Post) from the daily Excel ----------
 TEXT_KINDS = {
     "ndc": dict(head="*NDCs* Delivery Performance dated", who="NDCs", target="Daily Target", overall=True,
-                close="In View of Above, Divisions are requested to improve delivery performance in "
-                      "low-performing Offices and verify Offices reporting High Return and Redirection"),
+                close="Divisions are requested to improve delivery performance in low-performing Offices "
+                      "and take action to curtail Return and Redirection"),
     "dc": dict(head="*DCs* Delivery Performance dated", who="DCs", target="Daily Target", overall=True,
-               close="In View of Above, Divisions are requested to improve delivery performance in "
-                     "low-performing Offices and verify Offices reporting High Return and Redirection"),
+               close="Divisions are requested to improve delivery performance in low-performing Offices "
+                     "and take action to curtail Return and Redirection"),
     "24": dict(head="*_24 Speed Post_ at DCs/NDCs* Delivery Performance dated", who="NDCs/DCs",
                target="Successful Daily Target", overall=False,
                close="Divisions are requested to improve delivery performance in low-performing Offices "
