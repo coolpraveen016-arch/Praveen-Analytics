@@ -1,7 +1,8 @@
 """Delivery Transit Analysis (D+0): 1) generate reports from raw CSVs, 2) compare two periods."""
-import io, re, hmac, datetime
+import io, re, hmac, datetime, warnings
 import pandas as pd
-from openpyxl import Workbook
+from decimal import Decimal, ROUND_HALF_UP
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter as L
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
@@ -672,6 +673,127 @@ def make_hq_workbook(P, D, levels, bases, sort=11, desc=False, on=1):
     return to_bytes(wb), previews, notes
 
 
+# ---------- 1f) WhatsApp texts for NDCs / DCs / 24 (Speed Post) from the daily Excel ----------
+TEXT_KINDS = {
+    "ndc": dict(head="*NDCs* Delivery Performance dated", who="NDCs", target="Daily Target", overall=True,
+                close="In View of Above, Divisions are requested to improve delivery performance in "
+                      "low-performing Offices and verify Offices reporting High Return and Redirection"),
+    "dc": dict(head="*DCs* Delivery Performance dated", who="DCs", target="Daily Target", overall=True,
+               close="In View of Above, Divisions are requested to improve delivery performance in "
+                     "low-performing Offices and verify Offices reporting High Return and Redirection"),
+    "24": dict(head="*_24 Speed Post_ at DCs/NDCs* Delivery Performance dated", who="NDCs/DCs",
+               target="Successful Daily Target", overall=False,
+               close="Divisions are requested to improve delivery performance in low-performing Offices "
+                     "and take action to curtail Return and Redirection"),
+}
+
+
+def pct2(v):
+    """Fraction -> percent rounded to 2 decimals, half up (shows like Excel does: 0.85425 -> 85.43)."""
+    return Decimal(repr(round(float(v) * 100, 8))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def num_pct(v):
+    return pct2(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def find_sheet(wb, name):
+    for n in wb.sheetnames:
+        if " ".join(n.lower().split()) == name:
+            return wb[n]
+    raise ValueError(f"Sheet '{name}' not found in the Excel file.")
+
+
+def parse_sections(rows):
+    """Finds every '... Delivery Performance report dated ...' table on a sheet.
+    -> [{kind, title, items: [(office, {role: Decimal %})], total: {role: Decimal %}}]"""
+    secs, i = [], 0
+    while i < len(rows) - 1:
+        title = rows[i][1] if len(rows[i]) > 1 else None
+        if not (isinstance(title, str) and "delivery performance" in title.lower()):
+            i += 1
+            continue
+        roles = {}
+        for j, h in enumerate(rows[i + 1]):
+            t = norm(h) if h is not None else ""
+            if t.startswith("%") and "successfuldelivery" in t:
+                roles.setdefault("succ", j)
+            elif t == "%overalldelivery":
+                roles.setdefault("overall", j)
+            elif t.startswith("missent") and t.endswith("%"):
+                roles.setdefault("redir", j)          # 'Redirections' in the text = Missent %
+            elif t.startswith("return") and t.endswith("%"):
+                roles.setdefault("ret", j)
+        items, total, k = [], {}, i + 2
+        while k < len(rows):
+            r = rows[k]
+            name = r[1] if len(r) > 1 else None
+            if not isinstance(name, str) or not name.strip():
+                break
+            vals = {role: num_pct(r[j]) for role, j in roles.items() if j < len(r)}
+            if "overal" in name.lower():              # 'HQR Overal Performance'
+                total = vals
+                k += 1
+                break
+            items.append((" ".join(name.split()), vals))
+            k += 1
+        t = title.strip().lower()
+        kind = "ndc" if t.startswith("ndc") else "dc" if t.startswith("dc") else "24" if t.startswith("24") else "other"
+        secs.append({"kind": kind, "title": title, "items": items, "total": total})
+        i = k
+    return secs
+
+
+def read_text_workbook(data):
+    """-> {'ndc': section, 'dc': section, '24': section} (missing ones are left out)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        out = {}
+        for sheet in ("morning report", "24 morning report"):
+            try:
+                ws = find_sheet(wb, sheet)
+            except ValueError:
+                continue
+            for sec in parse_sections([list(r) for r in ws.iter_rows(values_only=True)]):
+                out.setdefault(sec["kind"], sec)
+    return out
+
+
+def report_date(title, fallback):
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", title or "")
+    try:
+        d = datetime.date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else fallback
+    except ValueError:
+        d = fallback
+    return f"{d:%d.%m.%Y} ({d:%A})"
+
+
+def make_text(kind, sec, fallback_date, target, mark, redir, ret):
+    """WhatsApp text for one section. mark = 'successful delivery below', redir / ret = 'above' limits (in %)."""
+    cfg, g = TEXT_KINDS[kind], (lambda x: f"{x:g}")
+    for role in ("succ", "redir", "ret"):
+        if not any(v.get(role) is not None for _, v in sec["items"]):
+            raise ValueError(f"column for '{role}' not found in the {cfg['who']} table")
+
+    def lines(role, test):
+        hit = [(n, v[role]) for n, v in sec["items"] if v.get(role) is not None and test(v[role])]
+        hit.sort(key=lambda t: t[1], reverse=True)
+        return "\n".join(f"* {n}\t{p}%" for n, p in hit) or "* None"
+
+    show = lambda role: f"{sec['total'][role]}%" if sec["total"].get(role) is not None else "N/A"
+    out = [f"{cfg['head']} *{report_date(sec['title'], fallback_date)}*", "",
+           f"{cfg['target']} : {g(target)}%", f"* Successful Delivery: *{show('succ')}*"]
+    if cfg["overall"]:
+        out.append(f"* Overall Delivery: *{show('overall')}*")
+    out += ["", f"*{cfg['who']} with Successful Delivery below {g(mark)}% are*",
+            lines("succ", lambda p: p < Decimal(str(mark))), "",
+            f"*{cfg['who']} with Redirections above {g(redir)}%*", lines("redir", lambda p: p > Decimal(str(redir))), "",
+            f"*{cfg['who']} with Returns above {g(ret)}%*", lines("ret", lambda p: p > Decimal(str(ret))), "",
+            cfg["close"]]
+    return "\n".join(out)
+
+
 # ---------- 2) Compare two report files ----------
 def parse_block(raw, hdr, name_col):
     roles = {}
@@ -1035,6 +1157,56 @@ def page_hq(st):
             holder.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
 
 
+def page_text(st):
+    sb = st.sidebar
+    sb.divider()
+    sb.header("Upload Report File")
+    f = sb.file_uploader("Daily report Excel (with the 'Morning report' and '24 Morning report' sheets)",
+                         type=["xlsx", "xlsm"], key="tx_file")
+    sb.date_input("Report date (used only if the sheet has no date)", datetime.date.today(), key="tx_date")
+    sb.divider()
+    sb.header("Options")
+    num = lambda label, v, key: sb.number_input(label, min_value=0.0, max_value=100.0, value=v, step=0.5,
+                                                format="%.1f", key=key)
+    opts = {}
+    for kind, head, d in (("ndc", "NDCs", (95.0, 85.0, 5.0, 5.0)), ("dc", "DCs", (95.0, 85.0, 5.0, 15.0)),
+                          ("24", "24 Speed Post (NDCs/DCs)", (85.0, 85.0, 5.0, 10.0))):
+        sb.subheader(head)
+        opts[kind] = (num("Daily target %", d[0], f"tx_{kind}_t"),
+                      num("Successful delivery mark % (list offices below)", d[1], f"tx_{kind}_m"),
+                      num("Redirection above %", d[2], f"tx_{kind}_r"),
+                      num("Return above %", d[3], f"tx_{kind}_x"))
+    st.title("Text for DC / NDC / 24 Reports")
+    st.info("Upload the daily Excel. The texts are made from the **Morning report** sheet (NDCs and DCs) and the "
+            "**24 Morning report** sheet. Set the successful delivery mark and the Redirection / Return limits "
+            "in the sidebar, then use the copy button on each text.")
+    if not f:
+        return
+    try:
+        secs = read_text_workbook(f.getvalue())
+    except Exception as e:
+        st.error(f"Could not read the Excel file: {e}")
+        return
+    fallback, texts = st.session_state.get("tx_date", datetime.date.today()), []
+    for kind, tab_name in (("ndc", "NDCs"), ("dc", "DCs"), ("24", "24 Speed Post")):
+        if kind not in secs:
+            st.warning(f"{tab_name}: table not found in the sheet - skipped.")
+            continue
+        try:
+            texts.append((tab_name, make_text(kind, secs[kind], fallback, *opts[kind])))
+        except Exception as e:
+            st.warning(f"{tab_name}: {e}")
+    if not texts:
+        return
+    st.download_button("Download all texts (.txt)", ("\n\n" + "-" * 30 + "\n\n").join(t for _, t in texts),
+                       "DC_NDC_24_texts.txt", "text/plain")
+    for tab, (_, text) in zip(st.tabs([n for n, _ in texts]), texts):
+        try:
+            tab.code(text, language=None, wrap_lines=True)
+        except TypeError:
+            tab.code(text, language=None)
+
+
 def page_compare(st):
     st.title("Delivery Transit Analysis (D+0) - Period Comparison")
     st.info("Upload the two report Excel files you want to compare (reports made by this app, or the "
@@ -1066,7 +1238,8 @@ def main():
         return
     pages = {"Region wise D+0 Reports": page_generate, "HQ D+0 Reports": page_hq,
              "Generate NDC / DC Reports": page_ndc_dc,
-             "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare}
+             "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare,
+             "Text for DC/NDC/24 Reports": page_text}
     pages[st.sidebar.radio("Select", list(pages))](st)
 
 
