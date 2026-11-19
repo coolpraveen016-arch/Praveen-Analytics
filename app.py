@@ -794,6 +794,144 @@ def make_text(kind, sec, fallback_date, target, mark, redir, ret):
     return "\n".join(out)
 
 
+# ---------- 1g) DSS App (Delivery Mobile App Usage) report ----------
+DSS_SORT = ["Name (A-Z)", "Period 1 Mobile Usage", "Period 2 Mobile Usage", "% Difference",
+            "Period 1 PDM article count", "Period 2 PDM article count"]
+LAVENDER, PEACH = PatternFill("solid", fgColor="DDA0DD"), PatternFill("solid", fgColor="F8CBAD")
+
+
+def read_dss(f):
+    """Mobile App Usage export (office level) -> (list of {id, div, sub, name, c=[PDM, DSS]}, level rank 0/1/2)."""
+    data = io.BytesIO(f.getvalue())
+    df = pd.read_csv(data) if f.name.lower().endswith(".csv") else pd.read_excel(data)
+    miss = [c for c in ["division-name", "office_name", "total_pdm_art_count", "total_dss_art_count"]
+            if c not in df.columns]
+    if miss:
+        raise ValueError(f"{f.name}: these columns are missing: {', '.join(miss)}. "
+                         "Please upload the Delivery Mobile App Usage export.")
+    if "sub-division-name" not in df.columns:
+        df["sub-division-name"] = ""
+    df = df[~df["office_name"].astype(str).str.strip().str.lower().str.startswith("summary")].copy()
+    for c in ("total_pdm_art_count", "total_dss_art_count"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    rows = []
+    for i, r in enumerate(df.to_dict("records")):
+        div, sub, name = clean(r["division-name"]), clean(r["sub-division-name"]), clean(r["office_name"])
+        oid = str(r["office_id"]) if "office_id" in r and pd.notna(r["office_id"]) else f"{div}|{sub}|{name}|{i}"
+        rows.append({"id": oid, "div": div, "sub": sub, "name": name,
+                     "c": [float(r["total_pdm_art_count"]), float(r["total_dss_art_count"])]})
+    if not rows:
+        raise ValueError(f"{f.name}: no data rows found.")
+    if all(r["sub"] == "" for r in rows) or all(r["name"] == r["div"] for r in rows):
+        rank = 0                                           # Division Level export
+    elif all(r["name"] == r["sub"] for r in rows):
+        rank = 1                                           # Sub Division Level export
+    else:
+        rank = 2                                           # Office Level export
+    return rows, rank
+
+
+def dss_aggregate(rows, level):
+    out = {}
+    for r in rows:
+        if level == "Division":
+            key, name, par = r["div"], r["div"], []
+        elif level == "Sub Division":
+            key, name, par = (r["div"], r["sub"]), r["sub"], [r["div"]]
+        else:
+            key, name, par = r["id"], r["name"], [r["div"], r["sub"]]
+        if key in out:
+            out[key][2] = [a + b for a, b in zip(out[key][2], r["c"])]
+        else:
+            out[key] = [name, par, list(r["c"])]
+    return out
+
+
+def dss_table(d1, d2, hide_zero, sort, desc):
+    """-> (rows, total). row = (name, parents, c1, c2, usage1, usage2, difference); c = [PDM, DSS]."""
+    rows = []
+    for k in list(d1) + [k for k in d2 if k not in d1]:
+        a, b = d1.get(k), d2.get(k)
+        src = b or a
+        c1, c2 = (a[2] if a else [0.0, 0.0]), (b[2] if b else [0.0, 0.0])
+        if hide_zero and not any(c1) and not any(c2):
+            continue
+        u1, u2 = sd(c1[1], c1[0]), sd(c2[1], c2[0])
+        rows.append((src[0], src[1], c1, c2, u1, u2, u2 - u1))
+    keys = {"Name (A-Z)": lambda r: r[0].lower(), "Period 1 Mobile Usage": lambda r: r[4],
+            "Period 2 Mobile Usage": lambda r: r[5], "% Difference": lambda r: r[6],
+            "Period 1 PDM article count": lambda r: r[2][0], "Period 2 PDM article count": lambda r: r[3][0]}
+    rows.sort(key=keys[sort], reverse=desc)
+    t1, t2 = [sum(r[2][i] for r in rows) for i in (0, 1)], [sum(r[3][i] for r in rows) for i in (0, 1)]
+    u1, u2 = sd(t1[1], t1[0]), sd(t2[1], t2[0])
+    return rows, ("Total", [""] * (len(rows[0][1]) if rows else 0), t1, t2, u1, u2, u2 - u1)
+
+
+def dss_values(r):
+    return [r[2][0], r[2][1], r[4], r[3][0], r[3][1], r[5], r[6]]
+
+
+def write_dss_sheet(ws, level, label1, label2, rows, total):
+    npar = len(LEVEL_PARENTS[level])
+    n0 = 1 + npar                                          # name + parent columns
+    b1, b2, last = n0 + 1, n0 + 4, n0 + 7
+    for j, h in enumerate([f"Name of the {level}"] + LEVEL_PARENTS[level]):
+        cell_put(ws, 1, j + 1, h, LAVENDER, True)
+        cell_put(ws, 2, j + 1, None, LAVENDER)
+        ws.merge_cells(start_row=1, start_column=j + 1, end_row=2, end_column=j + 1)
+    for col, lab in ((b1, label1), (b2, label2)):
+        for k in range(3):
+            cell_put(ws, 1, col + k, lab if k == 0 else None, LAVENDER, True)
+        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 2)
+        for k, h in enumerate(("Total PDM article count", "Total DSS article count", "Mobile Usage")):
+            cell_put(ws, 2, col + k, h, PEACH, True)
+    cell_put(ws, 1, last, "% Difference", LAVENDER, True)
+    cell_put(ws, 2, last, None, LAVENDER)
+    ws.merge_cells(start_row=1, start_column=last, end_row=2, end_column=last)
+    for k, r in enumerate(rows + [total]):
+        is_total, row = k == len(rows), 3 + k
+        fill = YELLOW if is_total else None
+        c = cell_put(ws, row, 1, r[0], fill, is_total)
+        c.alignment = Alignment(horizontal="center" if is_total else "left", vertical="center")
+        for j, p in enumerate(r[1]):
+            c = cell_put(ws, row, 2 + j, p, fill, is_total)
+            c.alignment = Alignment(horizontal="left", vertical="center")
+        for j, v in enumerate(dss_values(r)):
+            col = b1 + j
+            color = None
+            if col == last:
+                color = "FF0000" if v < -1e-9 else "00B050" if v > 1e-9 else None
+            cell_put(ws, row, col, v, fill, is_total, "0.00%" if col in (b1 + 2, b2 + 2, last) else "0", color)
+    ws.row_dimensions[1].height, ws.row_dimensions[2].height = 32, 50
+    ws.column_dimensions["A"].width = 36
+    for col in range(2, 2 + npar):
+        ws.column_dimensions[L(col)].width = 30
+    for col in range(b1, last + 1):
+        ws.column_dimensions[L(col)].width = 17
+    ws.freeze_panes = ws.cell(3, 2)
+
+
+def make_dss_report(rows1, rank1, rows2, rank2, levels, lab1, lab2, hide_zero, sort, desc):
+    wb = Workbook()
+    wb.remove(wb.active)
+    previews, notes = {}, []
+    need = {"Division": 0, "Sub Division": 1, "Office": 2}
+    for level in levels:
+        if need[level] > min(rank1, rank2):
+            notes.append(f"{level}-wise report skipped - it needs a "
+                         f"{'Sub Division Level or Office Level' if level == 'Sub Division' else 'Office Level'} export.")
+            continue
+        r, total = dss_table(dss_aggregate(rows1, level), dss_aggregate(rows2, level), hide_zero, sort, desc)
+        write_dss_sheet(wb.create_sheet(f"DSS App - {level}"), level, lab1, lab2, r, total)
+        cols = ([f"Name of the {level}"] + LEVEL_PARENTS[level]
+                + [f"{lab} - {h}" for lab in (lab1, lab2) for h in ("Total PDM article count", "Total DSS article count", "Mobile Usage")]
+                + ["% Difference"])
+        previews[level] = pd.DataFrame([[x[0]] + x[1] + dss_values(x) for x in r + [total]], columns=cols)
+    if not previews:
+        raise ValueError(" ".join(notes))
+    return to_bytes(wb), previews, notes
+
+
 # ---------- 2) Compare two report files ----------
 def parse_block(raw, hdr, name_col):
     roles = {}
@@ -900,6 +1038,14 @@ def run_comparison(bytes1, bytes2):
 
 
 # ---------- Streamlit screens ----------
+def df_show(holder, obj):
+    """Full-width table; works on old and new Streamlit versions."""
+    try:
+        holder.dataframe(obj, hide_index=True, width="stretch")
+    except TypeError:
+        holder.dataframe(obj, hide_index=True, use_container_width=True)
+
+
 def login(st):
     try:
         users = dict(st.secrets["users"])
@@ -968,7 +1114,7 @@ def page_generate(st):
     for tab, blocks in zip(st.tabs(list(previews)), previews.values()):
         for title, df in blocks:
             tab.subheader(title)
-            tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
+            df_show(tab, df.style.format(fmt))
 
 
 def page_ndc_dc(st):
@@ -1008,7 +1154,7 @@ def page_ndc_dc(st):
     for tab, blocks in zip(st.tabs(list(previews)), previews.values()):
         for title, df in blocks:
             tab.subheader(title)
-            tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
+            df_show(tab, df.style.format(fmt))
 
 
 def page_day(st):
@@ -1052,7 +1198,7 @@ def page_day(st):
         cols = (["S.No.", "Division Name", "Office Name"] + [f"{d1:%d.%m} {h}" for h in heads]
                 + [f"{d2:%d.%m} {h}" for h in heads] + ["% Inc/Dec"])
         fmt = {c: "{:.2%}" if ("%" in c) else "{:,.0f}" for c in cols[3:]}
-        tab.dataframe(pd.DataFrame(table, columns=cols).style.format(fmt), hide_index=True, use_container_width=True)
+        df_show(tab, pd.DataFrame(table, columns=cols).style.format(fmt))
 
 
 def hq_uploaders(sb, prefix, label, expanded=False):
@@ -1154,7 +1300,7 @@ def page_hq(st):
         for title, df, fm in blocks:
             holder.subheader(title)
             fmt = {c: FMT_PY[f] for c, f in zip(df.columns, fm) if f}
-            holder.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
+            df_show(holder, df.style.format(fmt))
 
 
 def page_text(st):
@@ -1207,6 +1353,54 @@ def page_text(st):
             tab.code(text, language=None)
 
 
+def page_dss(st):
+    sb = st.sidebar
+    today = datetime.date.today()
+    last_prev = today.replace(day=1) - datetime.timedelta(days=1)
+    sb.divider()
+    sb.header("Report Options")
+    lv = sb.multiselect("Report level", list(LEVELS), default=["Division-wise"], key="dss_lv")
+    sort_by = sb.selectbox("Sort by", DSS_SORT, key="dss_sort")
+    order = sb.radio("Order", ORDERS, key="dss_order")
+    hide_zero = sb.checkbox("Hide offices with no articles in both periods", value=True, key="dss_hide")
+    files, dates = {}, {}
+    for k, d_from, d_to in ((1, last_prev.replace(day=1), last_prev), (2, today.replace(day=1), today)):
+        sb.divider()
+        sb.header(f"Period {k}")
+        ca, cb = sb.columns(2)
+        dates[k] = (ca.date_input("From", d_from, key=f"dss_a{k}"), cb.date_input("To", d_to, key=f"dss_b{k}"))
+        files[k] = sb.file_uploader(f"Period {k} file (Delivery Mobile App Usage export)", type=["csv", "xlsx"],
+                                    key=f"dss_f{k}")
+    st.title("DSS App Report")
+    st.info("Pick the report level and the dates of the two periods in the sidebar, then upload the "
+            "**Delivery Mobile App Usage** export of each period. Mobile Usage = DSS article count / PDM article "
+            "count, and % Difference = Period 2 usage minus Period 1 usage (green = usage went up, red = went down).")
+    if not lv:
+        st.warning("Select at least one report level in the sidebar.")
+        return
+    if not (files[1] and files[2]):
+        return
+    try:
+        (r1, k1), (r2, k2) = read_dss(files[1]), read_dss(files[2])
+        txt = lambda k: f"{dates[k][0]:%d.%m.%Y} - {dates[k][1]:%d.%m.%Y}"
+        data, previews, notes = make_dss_report(r1, k1, r2, k2, [LEVELS[k] for k in LEVELS if k in lv],
+                                                txt(1), txt(2), hide_zero, sort_by, order == ORDERS[1])
+    except Exception as e:
+        st.error(f"Could not make the report: {e}")
+        return
+    for n in notes:
+        st.warning(n)
+    st.download_button("Download DSS App Report (Excel)", data, "DSS_App_Report.xlsx", XLSX, type="primary")
+    for tab, df in zip(st.tabs([f"{k}-wise" for k in previews]), previews.values()):
+        fmt = {c: ("{:.2%}" if ("Usage" in c or "Difference" in c) else "{:,.0f}") for c in df.columns[1 + df.shape[1] - 7 - 1:]
+               if c != df.columns[0]}
+        sty = df.style.format({c: f for c, f in fmt.items() if c in df.columns})
+        diff = [c for c in df.columns if c == "% Difference"]
+        mapper = getattr(sty, "map", None) or sty.applymap
+        sty = mapper(lambda v: "color: red" if v < -1e-9 else "color: green" if v > 1e-9 else "", subset=diff)
+        df_show(tab, sty)
+
+
 def page_compare(st):
     st.title("Delivery Transit Analysis (D+0) - Period Comparison")
     st.info("Upload the two report Excel files you want to compare (reports made by this app, or the "
@@ -1228,7 +1422,7 @@ def page_compare(st):
     for tab, blocks in zip(st.tabs(list(previews)), previews.values()):
         for title, df in blocks:
             tab.subheader(title)
-            tab.dataframe(df.style.format(fmt), hide_index=True, use_container_width=True)
+            df_show(tab, df.style.format(fmt))
 
 
 def main():
@@ -1239,7 +1433,7 @@ def main():
     pages = {"Region wise D+0 Reports": page_generate, "HQ D+0 Reports": page_hq,
              "Generate NDC / DC Reports": page_ndc_dc,
              "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare,
-             "Text for DC/NDC/24 Reports": page_text}
+             "Text for DC/NDC/24 Reports": page_text, "DSS App report": page_dss}
     pages[st.sidebar.radio("Select", list(pages))](st)
 
 
