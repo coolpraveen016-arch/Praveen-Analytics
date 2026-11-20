@@ -469,7 +469,7 @@ def period_text(p1, p2):
 # ---------- 1e) HQ D+0 comparison: every column as 1st Period | 2nd Period | Comparison ----------
 DIRN = [0, 0, 1, 0, 1, 0, -1, 0, -1, 1, 0, -1]     # +1 higher is better, -1 lower is better, 0 neutral
 CHG = {"#,##0": "+#,##0;-#,##0;0", "0.00%": "+0.00%;-0.00%;0.00%"}
-TRIO_FMT = [x for f in HQ_FMT for x in (f, f, CHG[f])]
+TRIO_FMT = HQ_FMT + HQ_FMT + [CHG[f] for f in HQ_FMT]      # block 1, block 2, comparison block
 FMT_PY = {"#,##0": "{:,.0f}", "0.00%": "{:.2%}", CHG["#,##0"]: "{:+,.0f}", CHG["0.00%"]: "{:+.2%}"}
 GREY = PatternFill("solid", fgColor="E7E6E6")
 HQ_GROUPS = [("All Products", "All Products", ["ap_all"], ["ap_bo"], 1),
@@ -516,10 +516,8 @@ def trio_table(level, d1, d2, recv, sort=11, desc=False, on=1):
     items.sort(key=key, reverse=desc)
 
     def line(sno, name, par, c1, c2):
-        row = [sno, name] + par
-        for x, y in zip(hq_metrics(c1, recv), hq_metrics(c2, recv)):
-            row += [x, y, y - x]
-        return row
+        m1, m2 = hq_metrics(c1, recv), hq_metrics(c2, recv)
+        return [sno, name] + par + m1 + m2 + [round(y - x, 4) for x, y in zip(m1, m2)]   # 4 decimals = 2 decimals in %
 
     npar = len(LEVEL_PARENTS[level])
     table = [line(i + 1, *it) for i, it in enumerate(items)]
@@ -539,9 +537,15 @@ def cell_put(ws, r, col, v, fill=None, bold=False, fmt=None, color=None):
     return c
 
 
-def write_trio(ws, r0, title, name_heads, groups, table, labels=("1st Period", "2nd Period")):
-    npar = len(name_heads)
-    ncols = npar + 3 * len(groups)
+SAGE = PatternFill("solid", fgColor="E9EEDC")
+P1_TINT, P2_TINT = PatternFill("solid", fgColor="FFFFCC"), PatternFill("solid", fgColor="F4F7EC")
+
+
+def write_trio(ws, r0, title, name_heads, groups, table, tops):
+    """Row r0 = title, r0+1 = Period 1 / Period 2 / comparison labels (with dates), r0+2 = metric names.
+    Columns: names | Period 1 metrics | Period 2 metrics | comparison of every metric."""
+    npar, nm = len(name_heads), len(groups)
+    ncols = npar + 3 * nm
     for col in range(1, ncols + 1):
         cell_put(ws, r0, col, title if col == 1 else None, GREEN, True)
     ws.merge_cells(start_row=r0, start_column=1, end_row=r0, end_column=ncols)
@@ -549,34 +553,35 @@ def write_trio(ws, r0, title, name_heads, groups, table, labels=("1st Period", "
         cell_put(ws, r0 + 1, j + 1, h, None, True)
         cell_put(ws, r0 + 2, j + 1, None)
         ws.merge_cells(start_row=r0 + 1, start_column=j + 1, end_row=r0 + 2, end_column=j + 1)
-    for g, h in enumerate(groups):
-        c0 = npar + 1 + 3 * g
-        for k, (lab, fill) in enumerate(((labels[0], BLUE), (labels[1], CREAM), ("Comparison", GREY))):
-            cell_put(ws, r0 + 1, c0 + k, h if k == 0 else None, None, True)
-            cell_put(ws, r0 + 2, c0 + k, lab, fill, True)
-        ws.merge_cells(start_row=r0 + 1, start_column=c0, end_row=r0 + 1, end_column=c0 + 2)
+    fills = (YELLOW, SAGE, None)
+    for b in range(3):
+        c0 = npar + 1 + b * nm
+        for k, h in enumerate(groups):
+            cell_put(ws, r0 + 1, c0 + k, tops[b] if k == 0 else None, fills[b], True)
+            cell_put(ws, r0 + 2, c0 + k, h if b < 2 else h.replace("\n", " ") + " Comparison", fills[b], True)
+        ws.merge_cells(start_row=r0 + 1, start_column=c0, end_row=r0 + 1, end_column=c0 + nm - 1)
     for k, row in enumerate(table):
         last = k == len(table) - 1
         for j, v in enumerate(row):
             fill = YELLOW if last else None
             fmt = color = None
             if j >= npar:
-                g, pos = divmod(j - npar, 3)
+                b, g = divmod(j - npar, nm)
                 fmt = TRIO_FMT[j - npar]
                 if not last:
-                    fill = BLUE if pos == 0 else CREAM if pos == 1 else None
-                if pos == 2 and DIRN[g] and abs(v) > 1e-9:
+                    fill = (P1_TINT, P2_TINT, None)[b]
+                if b == 2 and DIRN[g] and abs(v) > 1e-9:
                     fill, color = (GOOD, "006100") if v * DIRN[g] > 0 else (BAD, "9C0006")
             c = cell_put(ws, r0 + 3 + k, j + 1, v, fill, last, fmt, color)
             if 0 < j < npar:
                 c.alignment = Alignment(horizontal="left", vertical="center")
-    ws.row_dimensions[r0 + 1].height = 64
-    ws.row_dimensions[r0 + 2].height = 20
+    ws.row_dimensions[r0 + 1].height = 24
+    ws.row_dimensions[r0 + 2].height = 100
 
 
-def add_hq_comparison_sheets(wb, jobs, levels, bases, labels, per, sort=11, desc=False, on=1, prefix=""):
+def add_hq_comparison_sheets(wb, jobs, levels, bases, labels, ranges, sort=11, desc=False, on=1, prefix=""):
     """jobs = [(sheet, report name, all1, bo1, all2, bo2, rank)]; labels = names of the two compared periods;
-    per = text for the table titles. Returns (previews, notes)."""
+    ranges = date text of the two periods (shown at the top of each block). Returns (previews, notes)."""
     previews, notes = {}, []
     need = {"Division": 0, "Sub Division": 1, "Office": 2}
     label = {"Division": "any export", "Sub Division": "a Sub Division Level or Office Level export",
@@ -596,18 +601,22 @@ def add_hq_comparison_sheets(wb, jobs, levels, bases, labels, per, sort=11, desc
                 name = hq_sheet_name(prefix, sheet, level, recv, len(levels) > 1, len(bases) > 1)
                 ws, r0, blocks = wb.create_sheet(name), 1, []
                 for sc in scopes:
-                    title = f"Delivery Transit Analysis {rname}- {LEVEL_TITLE[level]}{sc} - {per}"
+                    title = (f"Delivery Transit Analysis {rname}- {LEVEL_TITLE[level]}{sc} - "
+                             f"{labels[0]} {ranges[0]} vs {labels[1]} {ranges[1]}")
+                    tops = (f"{labels[0]} : {ranges[0]}", f"{labels[1]} : {ranges[1]}", f"{labels[0]} Vs {labels[1]}")
                     nh, table = trio_table(level, s1[sc], s2[sc], recv, sort, desc, on)
-                    write_trio(ws, r0, title, nh, groups, table, labels)
+                    write_trio(ws, r0, title, nh, groups, table, tops)
                     r0 += len(table) + 4
-                    cols = nh + [f"{g.replace(chr(10), ' ')} - {lab}" for g in groups for lab in (*labels, "Comparison")]
+                    flat = [g.replace(chr(10), " ") for g in groups]
+                    cols = (nh + [f"{labels[0]} - {g}" for g in flat] + [f"{labels[1]} - {g}" for g in flat]
+                            + [f"{g} Comparison" for g in flat])
                     blocks.append((title, pd.DataFrame(table, columns=cols), [None] * len(nh) + TRIO_FMT))
                 ws.column_dimensions["A"].width, ws.column_dimensions["B"].width = 7, 34
                 npar = len(LEVEL_PARENTS[level])
                 for col in range(3, 3 + npar):
                     ws.column_dimensions[L(col)].width = 30
                 for col in range(3 + npar, 3 + npar + 36):
-                    ws.column_dimensions[L(col)].width = 13
+                    ws.column_dimensions[L(col)].width = 14
                 ws.freeze_panes = "C1"
                 previews[ws.title] = blocks
     return previews, notes
@@ -647,7 +656,7 @@ def make_hq_workbook(P, D, levels, bases, sort=11, desc=False, on=1):
     added = None
     if P.get(2) and P.get(3):
         keep(add_hq_comparison_sheets(wb, cjobs(P[2], P[3], "Period 2 and Period 3"), levels, bases,
-                                      ("Period 2", "Period 3"), f"Period 2 {txt(D[2])} vs Period 3 {txt(D[3])}",
+                                      ("Period 2", "Period 3"), (txt(D[2]), txt(D[3])),
                                       sort, desc, on, "P2vP3 "))     # 4) Period 2 vs Period 3
         added = {}
         for sh in in_both(P[2], P[3], "Period 2 and Period 3"):      # 5) Period 2 + Period 3
@@ -666,7 +675,7 @@ def make_hq_workbook(P, D, levels, bases, sort=11, desc=False, on=1):
             late, lab, pre, rng = P[k], f"Period {k}", f"P1vP{k} ", txt(D[k])
         if late:
             keep(add_hq_comparison_sheets(wb, cjobs(P[1], late, f"Period 1 and {lab}"), levels, bases,
-                                          ("Period 1", lab), f"Period 1 {txt(D[1])} vs {lab} {rng}",
+                                          ("Period 1", lab), (txt(D[1]), rng),
                                           sort, desc, on, pre))
     if not previews:
         raise ValueError(" ".join(notes) or "Nothing to make.")
