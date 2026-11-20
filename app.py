@@ -210,7 +210,7 @@ def make_office_reports(jobs, d1, d2):
 
 # ---------- 1c) Day-wise comparison (DCs / NDCs picked out of full all-offices files) ----------
 GROUPS = {"DCs (DC / IDC)": re.compile(r"\bI?DC\b", re.I), "NDCs": re.compile(r"\bNDC\b", re.I),
-          "26 Offices (NDCs + DCs)": re.compile(r"\b(?:NDC|I?DC)\b", re.I)}
+          "NDCs + DCs": re.compile(r"\b(?:NDC|I?DC)\b", re.I)}
 TOTAL_LABEL = "HQR"
 BLUE, CREAM = PatternFill("solid", fgColor="DDEBF7"), PatternFill("solid", fgColor="FFF2CC")
 GOOD, BAD = PatternFill("solid", fgColor="C6EFCE"), PatternFill("solid", fgColor="FFC7CE")
@@ -293,6 +293,113 @@ def day_workbook(title, d1, d2, rows, total):
     for name, detailed in (("Summary", False), ("Detailed", True)):
         heads, table = day_table(rows, total, detailed)
         write_day_sheet(wb.create_sheet(name), title, d1, d2, heads, table)
+    return to_bytes(wb)
+
+
+# ---------- 1c-2) The 26 offices (H.O. / S.O. list) and the Missent comparison layout ----------
+OFFICES_26 = ["UPPAL H.O", "Sangareddy H.O", "C.B.I.T S.O", "Chitrapuri Colony S.O.", "Golconda S.O",
+              "Hydershahkote S.O", "Amberpet S.O", "Hayatnagar S.O", "Hyderguda S.O", "Kanchanbagh S.O",
+              "Kattedan I.E. S.O", "P and T Colony (Gaddiannaram) S.O", "Ragannaguda X Road S.O",
+              "Rajendranagar S.O", "Rama Krishnapuram S.O", "S.V.P.N.P.A. S.O", "Saroornagar S.O",
+              "Vaishalinagar S.O", "Bolarum S.O", "Chandanagar S.O", "Ecil S.O", "Ghatkesar S.O",
+              "Malkajgiri S.O", "Miyapur S.O", "Ramakrishna Puram S.O", "Sainikpuri S.O"]
+LIST_GROUP = "26 Offices (list below)"
+FORMATS = ["Redirection - % on Received (Summary + Detailed sheets)",
+           "Missent - % on Invoiced (one sheet, as in the 26 offices sample)"]
+MISSENT_SORT = ["List order (as in the sample)", "Increase/Decrease (biggest improvement first)",
+                "Office name (A-Z)"]
+PINK, KHAKI = PatternFill("solid", fgColor="F8D7DA"), PatternFill("solid", fgColor="EAF1DD")
+
+
+def okey(n):
+    """Office name -> matching key: ignores case, dots and extra spaces ('S.O.' = 'S.O'), keeps the word breaks."""
+    return " ".join(re.sub(r"[^a-z0-9 ]", "", str(n).lower()).split())
+
+
+def pick_list(offices, names):
+    """Offices of a given list, kept in list order -> ({key: (name, division, counts)}, [names not found])."""
+    have = {}
+    for n, dv, c in offices:
+        have.setdefault(okey(n), (n, dv, c))
+    out, missing = {}, []
+    for nm in names:
+        k = okey(nm)
+        if k in out:
+            continue
+        if k in have:
+            out[k] = have[k]
+        else:
+            out[k] = (nm, "", [0.0] * 5)
+            missing.append(nm)
+    return out, missing
+
+
+def missent_rows(g1, g2, sort):
+    """-> (rows, total); row = (office, [invoiced1, redirected1, %missent1, invoiced2, redirected2, %missent2, change])."""
+    zero = (None, "", [0.0] * 5)
+    rows = []
+    for k in list(g1) + [k for k in g2 if k not in g1]:
+        a, b = g1.get(k, zero), g2.get(k, zero)
+        i1, r1, i2, r2 = a[2][1], a[2][3], b[2][1], b[2][3]
+        p1, p2 = sd(r1, i1), sd(r2, i2)
+        rows.append((b[0] or a[0], [i1, r1, p1, i2, r2, p2, p2 - p1]))
+    if sort == MISSENT_SORT[1]:
+        rows.sort(key=lambda r: r[1][6])
+    elif sort == MISSENT_SORT[2]:
+        rows.sort(key=lambda r: r[0].lower())
+    i1, r1 = sum(r[1][0] for r in rows), sum(r[1][1] for r in rows)
+    i2, r2 = sum(r[1][3] for r in rows), sum(r[1][4] for r in rows)
+    p1, p2 = sd(r1, i1), sd(r2, i2)
+    return rows, ("Total", [i1, r1, p1, i2, r2, p2, p2 - p1])
+
+
+def write_missent_sheet(ws, title, lab1, lab2, rows, total):
+    def put(r, col, v, fill=None, bold=False, fmt=None, color=None, size=11, h="center"):
+        c = ws.cell(r, col, v)
+        c.border, c.font = BOX, Font(name="Times New Roman", bold=bold, size=size, color=color)
+        c.alignment = Alignment(horizontal=h, vertical="center", wrap_text=True)
+        if fill:
+            c.fill = fill
+        if fmt:
+            c.number_format = fmt
+
+    for col in range(1, 10):
+        put(1, col, title if col == 1 else None, None, True, size=14)
+    ws.merge_cells("A1:I1")
+    for col, h in ((1, "S.no"), (2, "Office Name"), (9, "Increase/ Decrease")):
+        put(2, col, h, None, True)
+        put(3, col, None)
+        ws.merge_cells(start_row=2, start_column=col, end_row=3, end_column=col)
+    for col0, lab, fill in ((3, lab1, PINK), (6, lab2, KHAKI)):
+        for k, h in enumerate(("Same Day Invoiced", "D0 Redirected", "%Missent")):
+            put(2, col0 + k, lab if k == 0 else None, fill, True, size=12)
+            put(3, col0 + k, h, fill, True)
+        ws.merge_cells(start_row=2, start_column=col0, end_row=2, end_column=col0 + 2)
+    for k, (name, vals) in enumerate(rows + [total]):
+        is_total, r = k == len(rows), 4 + k
+        put(r, 1, "Total" if is_total else k + 1, None, is_total)
+        put(r, 2, "" if is_total else name, None, is_total, h="center")
+        if is_total:
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+        for j, v in enumerate(vals):
+            col = 3 + j
+            fill = PINK if col <= 5 else KHAKI if col <= 8 else None
+            color = None
+            if col == 9:
+                color = "FF0000" if v > 1e-9 else "00B050" if v < -1e-9 else None
+            put(r, col, v, fill, is_total, "0.00%" if col in (5, 8, 9) else "0", color)
+    ws.row_dimensions[1].height, ws.row_dimensions[2].height, ws.row_dimensions[3].height = 26, 32, 36
+    ws.column_dimensions["A"].width, ws.column_dimensions["B"].width = 7, 38
+    for col in "CDEFGHI":
+        ws.column_dimensions[col].width = 14
+    ws.freeze_panes = "C4"
+
+
+def missent_workbook(title, lab1, lab2, rows, total):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Missent Comparison"
+    write_missent_sheet(ws, title, lab1, lab2, rows, total)
     return to_bytes(wb)
 
 
@@ -1208,8 +1315,9 @@ def run_comparison(bytes1, bytes2):
 def df_show(holder, obj):
     """Full-width table; works on old and new Streamlit versions."""
     data = obj.data if obj.__class__.__name__ == "Styler" else obj
-    if "S.No." in data.columns:
-        data["S.No."] = data["S.No."].astype(str)
+    for c in data.columns:
+        if str(c).lower().replace(".", "") == "sno":          # S.No. / S.no: text, so a blank Total row is fine
+            data[c] = data[c].astype(str)
     try:
         holder.dataframe(obj, hide_index=True, width="stretch")
     except TypeError:
@@ -1339,27 +1447,65 @@ def page_day(st):
     f1 = sb.file_uploader("Earlier date file", type=["csv", "xlsx"], key="dd_f1")
     f2 = sb.file_uploader("Later date file", type=["csv", "xlsx"], key="dd_f2")
     sb.divider()
-    grp = sb.selectbox("Offices to include", list(GROUPS))
-    title = sb.text_input("Report title", "Speed Post Document")
-    st.title("Day-wise Comparison - Redirection")
-    st.info("Upload the full all-offices file of the **earlier date** and of the **later date** "
-            "(same product, e.g. Speed Letter). The offices you choose below (DCs, NDCs, or all 26 NDCs + DCs) are picked out automatically, compared, and "
-            "sorted by % Inc/Dec (biggest improvement first).")
+    sb.header("Offices and Format")
+    grp = sb.selectbox("Offices to include", list(GROUPS) + [LIST_GROUP], key="dd_grp")
+    is_list, names = grp == LIST_GROUP, OFFICES_26
+    if is_list:
+        text = sb.text_area("Offices (one per line - edit to change the list)", "\n".join(OFFICES_26),
+                            height=320, key="dd_list")
+        names = [x.strip() for x in text.splitlines() if x.strip()]
+    fmt = sb.selectbox("Report format", FORMATS, index=1 if is_list else 0)       # follows the office choice
+    msort = sb.selectbox("Sort rows by", MISSENT_SORT, index=0 if is_list else 1) if fmt == FORMATS[1] else None
+    title = sb.text_input("Report title", "Speed Post Document", key="dd_title")
+    st.title("Day-wise Comparison - Redirection / Missent")
+    st.info("Upload the full all-offices file of the **earlier date** and of the **later date** (same product, "
+            "e.g. Speed Letter). Choose the offices (DCs, NDCs, NDCs + DCs, or the list of 26 offices) and the "
+            "format: **Redirection** (% on Received, Summary + Detailed sheets, sorted by % Inc/Dec) or "
+            "**Missent** (% on Same Day Invoiced, one sheet).")
     if not (f1 and f2):
         return
     try:
-        g1 = pick_group(read_offices(f1)[0], GROUPS[grp])
-        g2 = pick_group(read_offices(f2)[0], GROUPS[grp])
-        if not g1 or not g2:
-            raise ValueError("no matching offices found in one of the files")
-        rows, total = day_compare(g1, g2)
+        o1, o2 = read_offices(f1)[0], read_offices(f2)[0]
+        if is_list:
+            (g1, m1), (g2, m2) = pick_list(o1, names), pick_list(o2, names)
+            if not names or len(m1) == len(g1) or len(m2) == len(g2):
+                raise ValueError("none of the listed offices were found in one of the files")
+        else:
+            g1, g2, m1, m2 = pick_group(o1, GROUPS[grp]), pick_group(o2, GROUPS[grp]), [], []
+            if not g1 or not g2:
+                raise ValueError("no matching offices found in one of the files")
+        if fmt == FORMATS[0]:
+            rows, total = day_compare(g1, g2)
+        else:
+            mrows, mtotal = missent_rows(g1, g2, msort)
     except Exception as e:
         st.error(f"Could not make the comparison: {e}")
         return
-    for a, b, lab in ((g1, g2, "later"), (g2, g1, "earlier")):
-        miss = [a[k][0] for k in a if k not in b]
+    for lab, miss in (("earlier", m1), ("later", m2)):
         if miss:
-            st.warning(f"Not in the {lab} date file (counted as zero there): " + ", ".join(miss))
+            st.warning(f"Not found in the {lab} date file (counted as zero): " + ", ".join(miss))
+    if not is_list:
+        for a, b, lab in ((g1, g2, "later"), (g2, g1, "earlier")):
+            miss = [a[k][0] for k in a if k not in b]
+            if miss:
+                st.warning(f"Not in the {lab} date file (counted as zero there): " + ", ".join(miss))
+    if fmt == FORMATS[1]:
+        lab1, lab2 = f"{d1:%d.%m.%Y}", f"{d2:%d.%m.%Y}"
+        st.caption(f"{len(mrows)} offices compared.")
+        st.download_button("Download Missent Comparison (Excel)",
+                           missent_workbook(f"Missent Comparison for {title}", lab1, lab2, mrows, mtotal),
+                           "Missent_Comparison.xlsx", XLSX, type="primary")
+        cols = (["S.no", "Office Name"] + [f"{lab} - {h}" for lab in (lab1, lab2)
+                                          for h in ("Same Day Invoiced", "D0 Redirected", "%Missent")]
+                + ["Increase/Decrease"])
+        table = [[i + 1, r[0]] + r[1] for i, r in enumerate(mrows)] + [["", "Total"] + mtotal[1]]
+        sty = pd.DataFrame(table, columns=cols).style.format(
+            {c: "{:.2%}" if ("%" in c or c == "Increase/Decrease") else "{:,.0f}" for c in cols[2:]})
+        mapper = getattr(sty, "map", None) or sty.applymap
+        sty = mapper(lambda v: "color: red" if v > 1e-9 else "color: green" if v < -1e-9 else "",
+                     subset=["Increase/Decrease"])
+        df_show(st, sty)
+        return
     st.caption(f"{len(rows)} offices compared.")
     st.download_button("Download Comparison Excel", day_workbook(title, d1, d2, rows, total),
                        "Day_wise_Comparison.xlsx", XLSX, type="primary")
@@ -1367,8 +1513,8 @@ def page_day(st):
         heads, table = day_table(rows, total, detailed)
         cols = (["S.No.", "Division Name", "Office Name"] + [f"{d1:%d.%m} {h}" for h in heads]
                 + [f"{d2:%d.%m} {h}" for h in heads] + ["% Inc/Dec"])
-        fmt = {c: "{:.2%}" if ("%" in c) else "{:,.0f}" for c in cols[3:]}
-        df_show(tab, pd.DataFrame(table, columns=cols).style.format(fmt))
+        fmt_ = {c: "{:.2%}" if ("%" in c) else "{:,.0f}" for c in cols[3:]}
+        df_show(tab, pd.DataFrame(table, columns=cols).style.format(fmt_))
 
 
 def hq_uploaders(sb, prefix, label, expanded=False):
