@@ -209,7 +209,8 @@ def make_office_reports(jobs, d1, d2):
 
 
 # ---------- 1c) Day-wise comparison (DCs / NDCs picked out of full all-offices files) ----------
-GROUPS = {"DCs (DC / IDC)": re.compile(r"\bI?DC\b", re.I), "NDCs": re.compile(r"\bNDC\b", re.I)}
+GROUPS = {"DCs (DC / IDC)": re.compile(r"\bI?DC\b", re.I), "NDCs": re.compile(r"\bNDC\b", re.I),
+          "26 Offices (NDCs + DCs)": re.compile(r"\b(?:NDC|I?DC)\b", re.I)}
 TOTAL_LABEL = "HQR"
 BLUE, CREAM = PatternFill("solid", fgColor="DDEBF7"), PatternFill("solid", fgColor="FFF2CC")
 GOOD, BAD = PatternFill("solid", fgColor="C6EFCE"), PatternFill("solid", fgColor="FFC7CE")
@@ -1206,6 +1207,9 @@ def run_comparison(bytes1, bytes2):
 # ---------- Streamlit screens ----------
 def df_show(holder, obj):
     """Full-width table; works on old and new Streamlit versions."""
+    data = obj.data if obj.__class__.__name__ == "Styler" else obj
+    if "S.No." in data.columns:
+        data["S.No."] = data["S.No."].astype(str)
     try:
         holder.dataframe(obj, hide_index=True, width="stretch")
     except TypeError:
@@ -1339,7 +1343,7 @@ def page_day(st):
     title = sb.text_input("Report title", "Speed Post Document")
     st.title("Day-wise Comparison - Redirection")
     st.info("Upload the full all-offices file of the **earlier date** and of the **later date** "
-            "(same product, e.g. Speed Letter). The DCs are picked out automatically, compared, and "
+            "(same product, e.g. Speed Letter). The offices you choose below (DCs, NDCs, or all 26 NDCs + DCs) are picked out automatically, compared, and "
             "sorted by % Inc/Dec (biggest improvement first).")
     if not (f1 and f2):
         return
@@ -1353,9 +1357,9 @@ def page_day(st):
         st.error(f"Could not make the comparison: {e}")
         return
     for a, b, lab in ((g1, g2, "later"), (g2, g1, "earlier")):
-        for k in a:
-            if k not in b:
-                st.warning(f"{a[k][0]} is missing in the {lab} date file - counted as zero there.")
+        miss = [a[k][0] for k in a if k not in b]
+        if miss:
+            st.warning(f"Not in the {lab} date file (counted as zero there): " + ", ".join(miss))
     st.caption(f"{len(rows)} offices compared.")
     st.download_button("Download Comparison Excel", day_workbook(title, d1, d2, rows, total),
                        "Day_wise_Comparison.xlsx", XLSX, type="primary")
