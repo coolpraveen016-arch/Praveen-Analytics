@@ -941,6 +941,163 @@ def make_dss_report(rows1, rank1, rows2, rank2, levels, lab1, lab2, hide_zero, s
     return to_bytes(wb), previews, notes
 
 
+# ---------- 1h) COD Collection report (cash vs digital COD transactions) ----------
+COD_HEADS = ["Sum of COD Cash Count", "Sum of COD Digital Count", "Sum of Total COD Count", "% of Digital Transactions"]
+COD_PARENTS = {"Division": [], "Sub Division": [], "Office": ["Division", "Sub Division"]}
+COD_SORT = ["Difference", "% of Digital Transactions", "Name (A-Z)", "COD Cash Count", "COD Digital Count",
+            "Total COD Count"]
+
+
+def read_cod(f):
+    """COD Collection export -> (list of {id, div, sub, name, c=[cash, digital, total]}, level rank 0/1/2)."""
+    data = io.BytesIO(f.getvalue())
+    df = pd.read_csv(data) if f.name.lower().endswith(".csv") else pd.read_excel(data)
+    counts = ["COD Cash Count", "COD Digital Count", "Total COD Count"]
+    miss = [c for c in ["Division Name"] + counts if c not in df.columns]
+    if miss:
+        raise ValueError(f"{f.name}: these columns are missing: {', '.join(miss)}. "
+                         "Please upload the COD Collection Performance export.")
+    for c in ("Sub Division Name", "Office Name"):
+        if c not in df.columns:
+            df[c] = ""
+    for c in counts:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    blank = lambda x: (x.isna() | (x.astype(str).str.strip() == "")).all()
+    off_blank, sub_blank = blank(df["Office Name"]), blank(df["Sub Division Name"])
+    rows = []
+    for i, r in enumerate(df.to_dict("records")):
+        div, sub, name = clean(r["Division Name"]), clean(r["Sub Division Name"]), clean(r["Office Name"])
+        try:
+            oid = str(int(float(r["Office ID"])))
+        except (KeyError, TypeError, ValueError):
+            oid = f"{div}|{sub}|{name}"
+        rows.append({"id": oid, "div": div, "sub": sub, "name": name or sub or div,
+                     "c": [float(r[c]) for c in counts]})
+    if not rows:
+        raise ValueError(f"{f.name}: no data rows found.")
+    if (off_blank and sub_blank) or (not off_blank and all(r["name"] == r["div"] for r in rows)):
+        rank = 0                                           # Division Level export
+    elif off_blank or all(r["name"] == r["sub"] for r in rows):
+        rank = 1                                           # Sub Division Level export
+    else:
+        rank = 2                                           # Office Level export
+    return rows, rank
+
+
+def cod_aggregate(rows, level):
+    out = {}
+    for r in rows:
+        if level == "Division":
+            key, name, par = r["div"], r["div"], []
+        elif level == "Sub Division":
+            sub = r["sub"] or f"{r['div']} (no sub division)"
+            key, name, par = (r["div"], sub), sub, []
+        else:
+            key, name, par = r["id"], r["name"], [r["div"], r["sub"]]
+        if key in out:
+            out[key][2] = [a + b for a, b in zip(out[key][2], r["c"])]
+        else:
+            out[key] = [name, par, list(r["c"])]
+    return out
+
+
+def cod_rows(dicts, sort, desc):
+    """dicts = [period 1] or [period 1, period 2] -> (rows, total).
+    row = (name, parents, [[cash, digital, total, % digital] per period], difference or None)."""
+    two = len(dicts) == 2
+    keys = list(dicts[0]) + ([k for k in dicts[1] if k not in dicts[0]] if two else [])
+    pct = lambda c: sd(c[1], c[2]) * 100
+    rows = []
+    for k in keys:
+        src = next(d[k] for d in dicts if k in d)
+        blocks = []
+        for d in dicts:
+            c = d[k][2] if k in d else [0.0, 0.0, 0.0]
+            blocks.append(c + [pct(c)])
+        diff = blocks[1][3] - blocks[0][3] if two and blocks[0][2] and blocks[1][2] else None
+        rows.append((src[0], src[1], blocks, diff))
+    key = {"Name (A-Z)": lambda r: r[0].lower(), "COD Cash Count": lambda r: r[2][-1][0],
+           "COD Digital Count": lambda r: r[2][-1][1], "Total COD Count": lambda r: r[2][-1][2],
+           "% of Digital Transactions": lambda r: r[2][-1][3],
+           "Difference": (lambda r: r[3]) if two else (lambda r: r[2][-1][3])}[sort]
+    ok = sorted([r for r in rows if key(r) is not None], key=key, reverse=desc)
+    rows = ok + [r for r in rows if key(r) is None]       # rows without a difference go last
+    tot = []
+    for p in range(len(dicts)):
+        c = [sum(r[2][p][i] for r in rows) for i in range(3)]
+        tot.append(c + [pct(c)])
+    diff = tot[1][3] - tot[0][3] if two and tot[0][2] and tot[1][2] else None
+    return rows, ("Grand Total", [""] * (len(rows[0][1]) if rows else 0), tot, diff)
+
+
+def write_cod_sheet(ws, level, labels, rows, total):
+    """Yellow header like the sample: date over each block of 4 columns, then the column names."""
+    npar, two = len(COD_PARENTS[level]), len(labels) == 2
+    n0 = 1 + npar
+    for j, h in enumerate([level] + COD_PARENTS[level]):
+        cell_put(ws, 1, j + 1, h, YELLOW, True)
+        cell_put(ws, 2, j + 1, None, YELLOW)
+        ws.merge_cells(start_row=1, start_column=j + 1, end_row=2, end_column=j + 1)
+    for p, lab in enumerate(labels):
+        c0 = n0 + 1 + 4 * p
+        for k, h in enumerate(COD_HEADS):
+            cell_put(ws, 1, c0 + k, lab if k == 0 else None, YELLOW, True)
+            cell_put(ws, 2, c0 + k, h, YELLOW, True)
+        ws.merge_cells(start_row=1, start_column=c0, end_row=1, end_column=c0 + 3)
+    if two:
+        cell_put(ws, 1, n0 + 9, "Difference", YELLOW, True)
+        cell_put(ws, 2, n0 + 9, None, YELLOW)
+        ws.merge_cells(start_row=1, start_column=n0 + 9, end_row=2, end_column=n0 + 9)
+    for k, r in enumerate(rows + [total]):
+        is_total, row = k == len(rows), 3 + k
+        fill = YELLOW if is_total else None
+        cell_put(ws, row, 1, r[0], fill, is_total)
+        for j, p in enumerate(r[1]):
+            cell_put(ws, row, 2 + j, p, fill, is_total)
+        flat = [v for blk in r[2] for v in blk] + ([r[3]] if two else [])
+        for j, v in enumerate(flat):
+            cell_put(ws, row, n0 + 1 + j, v, fill, is_total, "0.00" if (j % 4 == 3 or j == 8) else "0")
+    ws.row_dimensions[1].height, ws.row_dimensions[2].height = 30, 48
+    ws.column_dimensions["A"].width = 38
+    for col in range(2, 2 + npar):
+        ws.column_dimensions[L(col)].width = 30
+    for col in range(n0 + 1, n0 + 10):
+        ws.column_dimensions[L(col)].width = 17
+    ws.freeze_panes = ws.cell(3, 2)
+
+
+def make_cod_report(p1, p2, levels, sort, desc):
+    """p1 / p2 = (rows, rank, date label) or None. One period -> its report; both -> Period 1, Period 2 and
+    their comparison (3 sheets per level)."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    previews, notes = {}, []
+    per = [(k, p) for k, p in ((1, p1), (2, p2)) if p]
+    need = {"Division": 0, "Sub Division": 1, "Office": 2}
+    for level in levels:
+        if need[level] > min(p[1] for _, p in per):
+            notes.append(f"{level}-wise report skipped - it needs "
+                         f"{'a Sub Division Level or Office Level' if level == 'Sub Division' else 'an Office Level'} export.")
+            continue
+        suffix = f" - {LEVEL_SHORT[level]}" if len(levels) > 1 else ""
+        aggs = [(k, p[2], cod_aggregate(p[0], level)) for k, p in per]
+        sheets = [(f"Period {k}{suffix}", [lab], [d]) for k, lab, d in aggs]
+        if len(aggs) == 2:
+            sheets.append((f"Comparison{suffix}", [aggs[0][1], aggs[1][1]], [aggs[0][2], aggs[1][2]]))
+        for name, labels, ds in sheets:
+            rows, total = cod_rows(ds, sort, desc)
+            write_cod_sheet(wb.create_sheet(name), level, labels, rows, total)
+            cols = [level] + COD_PARENTS[level]
+            cols += [f"{lab} - {h}" if len(labels) == 2 else h for lab in labels for h in COD_HEADS]
+            cols += ["Difference"] if len(labels) == 2 else []
+            table = [[r[0]] + r[1] + [v for blk in r[2] for v in blk] + ([r[3]] if len(labels) == 2 else [])
+                     for r in rows + [total]]
+            previews[name] = (f"{level}-wise: {' vs '.join(labels)}", pd.DataFrame(table, columns=cols))
+    if not previews:
+        raise ValueError(" ".join(notes))
+    return to_bytes(wb), previews, notes
+
+
 # ---------- 2) Compare two report files ----------
 def parse_block(raw, hdr, name_col):
     roles = {}
@@ -1410,6 +1567,62 @@ def page_dss(st):
         df_show(tab, sty)
 
 
+def page_cod(st):
+    sb = st.sidebar
+    today = datetime.date.today()
+    sb.divider()
+    sb.header("Report Options")
+    lv = sb.multiselect("Report level", list(LEVELS), default=["Division-wise"], key="cod_lv")
+    sort_by = sb.selectbox("Sort by (latest period)", COD_SORT, key="cod_sort")
+    order = sb.radio("Order", ORDERS, index=1, key="cod_order")
+    files, dates = {}, {}
+    for k, d_from, d_to in ((1, today - datetime.timedelta(days=14), today - datetime.timedelta(days=8)),
+                            (2, today - datetime.timedelta(days=7), today - datetime.timedelta(days=1))):
+        sb.divider()
+        sb.header(f"Period {k}" + (" (optional)" if k == 2 else ""))
+        ca, cb = sb.columns(2)
+        dates[k] = (ca.date_input("Delivery date from", d_from, key=f"cod_a{k}"),
+                    cb.date_input("Delivery date to", d_to, key=f"cod_b{k}"))
+        files[k] = sb.file_uploader(f"Period {k} file (COD Collection export)", type=["csv", "xlsx"], key=f"cod_f{k}")
+    st.title("COD Collection Report")
+    st.info("Upload the **COD Collection Performance** export of one period to get its report, or of both periods "
+            "to get Period 1, Period 2 and their comparison (3 sheets). % of Digital Transactions = Digital count / "
+            "Total COD count, and Difference = Period 2 minus Period 1 (percentage points).")
+    if not lv:
+        st.warning("Select at least one report level in the sidebar.")
+        return
+    if not (files[1] or files[2]):
+        return
+    try:
+        txt = lambda k: f"{dates[k][0]:%d.%m.%Y} to {dates[k][1]:%d.%m.%Y}"
+        ps = []
+        for k in (1, 2):
+            if files[k]:
+                rows, rank = read_cod(files[k])
+                ps.append((rows, rank, txt(k)))
+            else:
+                ps.append(None)
+        data, previews, notes = make_cod_report(ps[0], ps[1], [LEVELS[k] for k in LEVELS if k in lv], sort_by,
+                                                order == ORDERS[1])
+    except Exception as e:
+        st.error(f"Could not make the report: {e}")
+        return
+    for n in notes:
+        st.warning(n)
+    st.download_button("Download COD Collection Report (Excel)", data, "COD_Collection_Report.xlsx", XLSX,
+                       type="primary")
+    if len(previews) > 3:
+        pick = st.selectbox("Preview sheet", list(previews))
+        views = [(st.container(), previews[pick])]
+    else:
+        views = list(zip(st.tabs(list(previews)), previews.values()))
+    for holder, (title, df) in views:
+        holder.subheader(title)
+        fmt = {c: "{:.2f}" if ("%" in c or c.endswith("Difference")) else "{:,.0f}" for c in df.columns
+               if any(h in c for h in COD_HEADS) or c == "Difference"}
+        df_show(holder, df.style.format(fmt, na_rep=""))
+
+
 def page_compare(st):
     st.title("Delivery Transit Analysis (D+0) - Period Comparison")
     st.info("Upload the two report Excel files you want to compare (reports made by this app, or the "
@@ -1442,7 +1655,8 @@ def main():
     pages = {"Region wise D+0 Reports": page_generate, "HQ D+0 Reports": page_hq,
              "Generate NDC / DC Reports": page_ndc_dc,
              "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare,
-             "Text for DC/NDC/24 Reports": page_text, "DSS App report": page_dss}
+             "Text for DC/NDC/24 Reports": page_text, "DSS App report": page_dss,
+             "COD Collection Report": page_cod}
     pages[st.sidebar.radio("Select", list(pages))](st)
 
 
