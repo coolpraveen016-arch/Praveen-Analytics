@@ -1206,6 +1206,197 @@ def make_cod_report(p1, p2, levels, sort, desc):
     return to_bytes(wb), previews, notes
 
 
+# ---------- 1i) PowerPoint slides from the HQ comparison (add-on: does not change the Excel reports) ----------
+PPT_PRODUCT = {"All Products": "All Products", "Speed Letter": "Speed Post Document", "Parcels": "Parcels"}
+PPT_TAG = {"All Offices": "All Offices", "BOs": "BOs", "Excluding BOs": "Exc. BOs"}
+PPT_LEVELS = {"Sub Division-wise": "Sub Division", "Division-wise": "Division"}
+PPT_YELLOW, PPT_PEACH = "FFFF00", "F7DCC2"
+PPT_RED, PPT_GREEN = "FF0000", "13803A"
+
+
+def indian(n):
+    """312920 -> '3,12,920' (Indian digit grouping, as in the reference slides)."""
+    s = str(int(round(n)))
+    neg, s = s.startswith("-"), s.lstrip("-")
+    if len(s) > 3:
+        head, tail, parts = s[:-3], s[-3:], []
+        while len(head) > 2:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        s = ",".join(parts + [tail])
+    return ("-" if neg else "") + s
+
+
+def pstr(v):
+    d = pct2(v)
+    return f"{Decimal('0.00') if d == 0 else d}%"
+
+
+def hq_ppt_pairs(P, D):
+    """Comparisons that can be put on slides -> {label: (earlier products, later products, earlier dates, later dates)}.
+    P = {1: .., 2: .., 3: ..} from hq_read_period; D = {k: (from, to)}."""
+    txt = lambda t: f"{t[0]:%d.%m.%Y} to {t[1]:%d.%m.%Y}"
+    added = None
+    if P.get(2) and P.get(3):
+        added = {}
+        for sh in P[2]:
+            if sh in P[3]:
+                x, y = P[2][sh], P[3][sh]
+                added[sh] = (x[0], x[1] + y[1], (x[2] + y[2]) if (x[2] and y[2]) else [], min(x[3], y[3]))
+    out = {}
+    if P.get(1) and added:
+        out["Period 1 vs Period 2+3 (added)"] = (P[1], added, txt(D[1]), period_text(D[2], D[3]))
+    for a, b in ((1, 2), (1, 3), (2, 3)):
+        if P.get(a) and P.get(b):
+            out[f"Period {a} vs Period {b}"] = (P[a], P[b], txt(D[a]), txt(D[b]))
+    return out
+
+
+def ppt_name(n):
+    """Names as on the reference slides: 'IP MEDAK NORTH Sub Division' -> 'MEDAK NORTH', 'Medak Division' -> 'Medak'."""
+    n = re.sub(r"\s*\(no sub division\)\s*$", "", str(n), flags=re.I)
+    n = re.sub(r"\s+(sub\s+)?division\s*$", "", n, flags=re.I)
+    return re.sub(r"^(IP|ASP)\s+(?=\S)", "", n.strip())
+
+
+def _ppt_cell(cell, text, size, bold=False, fill="FFFFFF", color="000000", align=None):
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+    from pptx.oxml.ns import qn
+    from lxml import etree
+    tcPr = cell._tc.get_or_add_tcPr()
+    for tag in ("a:lnL", "a:lnR", "a:lnT", "a:lnB"):                 # thin black borders (before the fill element)
+        ln = etree.SubElement(tcPr, qn(tag), w="9525", cap="flat", cmpd="sng", algn="ctr")
+        etree.SubElement(etree.SubElement(ln, qn("a:solidFill")), qn("a:srgbClr"), val="000000")
+        etree.SubElement(ln, qn("a:prstDash"), val="solid")
+    cell.fill.solid()
+    cell.fill.fore_color.rgb = RGBColor.from_string(fill)
+    cell.margin_left = cell.margin_right = Inches(0.04)
+    cell.margin_top = cell.margin_bottom = Inches(0.02)
+    cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+    cell.text_frame.word_wrap = True
+    p = cell.text_frame.paragraphs[0]
+    p.alignment = align or PP_ALIGN.CENTER
+    run = p.add_run()
+    run.text = text
+    run.font.size, run.font.bold, run.font.name = Pt(size), bold, "Calibri"
+    run.font.color.rgb = RGBColor.from_string(color)
+
+
+def _ppt_slide(prs, title, tag, labels, level, nh, table, kind):
+    """One slide: peach title box + scope tag, then the yellow-header table (as in the reference slides)."""
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+    from pptx.oxml.ns import qn
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    for text, x, w, size, align in ((title, 0.39, 10.2, 20, PP_ALIGN.LEFT), (tag, 10.75, 2.19, 22, PP_ALIGN.CENTER)):
+        box = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(0.28), Inches(w), Inches(0.6))
+        box.fill.solid()
+        box.fill.fore_color.rgb = RGBColor.from_string(PPT_PEACH)
+        box.line.fill.background()
+        box.shadow.inherit = False
+        style = box._element.find(qn("p:style"))                       # drop the theme style (no shadow / outline)
+        if style is not None:
+            box._element.remove(style)
+        tf = box.text_frame
+        tf.vertical_anchor, tf.word_wrap = MSO_ANCHOR.MIDDLE, True
+        tf.margin_left = Inches(0.12)
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size, run.font.bold, run.font.name = Pt(size), True, "Calibri"
+        run.font.color.rgb = RGBColor.from_string("000000")
+    npar = len(nh)
+    names = nh[2:]                                                      # parent columns (Division for Sub Division)
+    delivery = kind == "delivery"
+    block = ["Invoiced", "D+0 Actual Delivery", "D+0 Actual Delivery %"] if delivery else \
+        ["Invoiced", "Redirection %", "Return %", "Redirection + Return count", "Redirection + Return %"]
+    ng, n = len(block), len(table) - 1
+    ncols = 1 + len(names) + 2 * ng + 1
+    shape = slide.shapes.add_table(len(table) + 2, ncols, Inches(0.39), Inches(1.1), Inches(12.55), Inches(5.5))
+    tbl = shape.table
+    tbl.first_row = tbl.horz_banding = False
+    name_w = ([2.2, 2.0] if delivery else [1.75, 1.65]) if names else [2.6]
+    num_w = (12.55 - sum(name_w)) / (ncols - len(name_w))
+    for j in range(ncols):
+        tbl.columns[j].width = Inches(name_w[j] if j < len(name_w) else num_w)
+    size = 16 if n <= 6 else 14 if n <= 10 else 12 if n <= 14 else 11
+    h0, h1 = 0.34, 0.6 if delivery else 0.85
+    per = min(0.5, (7.5 - 1.1 - 0.3 - h0 - h1) / (n + 1))
+    tbl.rows[0].height, tbl.rows[1].height = Inches(h0), Inches(h1)
+    for r in range(2, len(table) + 2):
+        tbl.rows[r].height = Inches(per)
+    first = ["Sub Division" if level == "Sub Division" else "Division"] + names
+    heads = first + block + block + ["Difference"]
+    dates = [""] * len(first) + [labels[0]] + [""] * (ng - 1) + [labels[1]] + [""] * (ng - 1) + [""]
+    for j in range(ncols):
+        _ppt_cell(tbl.cell(0, j), dates[j], size + 1, True, PPT_YELLOW)
+        _ppt_cell(tbl.cell(1, j), heads[j], size if (delivery or size > 12) else size - 1.5, True, PPT_YELLOW)
+    for c0 in (len(first), len(first) + ng):
+        tbl.cell(0, c0).merge(tbl.cell(0, c0 + ng - 1))
+    good = -1 if kind == "redrt" else 1                                  # which direction of change is good
+    for i, r in enumerate(table):
+        last = i == len(table) - 1
+        m1, m2, ch = r[npar:npar + 12], r[npar + 12:npar + 24], r[npar + 24:npar + 36]
+        if delivery:
+            vals = [indian(m1[1]), indian(m1[3]), pstr(m1[4]), indian(m2[1]), indian(m2[3]), pstr(m2[4])]
+            diff = ch[4]
+        else:
+            vals = [indian(m1[1]), pstr(m1[6]), pstr(m1[8]), indian(m1[10]), pstr(m1[11]),
+                    indian(m2[1]), pstr(m2[6]), pstr(m2[8]), indian(m2[10]), pstr(m2[11])]
+            diff = ch[11]
+        lead = [""] * (1 + len(names)) if last else [ppt_name(x) for x in [r[1]] + list(r[2:npar])]
+        fill = PPT_YELLOW if last else "FFFFFF"
+        for j, v in enumerate(lead + vals):
+            _ppt_cell(tbl.cell(2 + i, j), v, size, last, fill, align=PP_ALIGN.LEFT if (j < len(lead) and not last) else None)
+        color = "000000" if abs(diff) < 0.00005 else (PPT_GREEN if diff * good > 0 else PPT_RED)
+        _ppt_cell(tbl.cell(2 + i, ncols - 1), pstr(diff), size, last, fill, color)
+    return slide
+
+
+def make_hq_ppt(early, later, ranges, level, wording):
+    """early / later = {sheet: (report name, [All rows], [BO rows], rank)}; ranges = date text of the two periods.
+    -> (pptx bytes, notes, number of slides). Slides: all Delivery slides first, then all Return & Redirection slides;
+    for each product: All Offices, BOs, Exc. BOs (the last two only when both periods have a BOs file)."""
+    from pptx import Presentation
+    from pptx.util import Inches
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    need, notes, count = {"Division": 0, "Sub Division": 1}[level], [], 0
+    for kind, what, sort, desc in (("delivery", "Actual Delivery", 4, True), ("redrt", "Return & Redirection", 11, False)):
+        for sh in PPT_PRODUCT:
+            if sh not in early or sh not in later:
+                if kind == "delivery" and (sh in early or sh in later):
+                    notes.append(f"{PPT_PRODUCT[sh]}: files are needed for both periods - no slides.")
+                continue
+            x, y = early[sh], later[sh]
+            if need > min(x[3], y[3]):
+                if kind == "delivery":
+                    notes.append(f"{PPT_PRODUCT[sh]}: {level}-wise slides need a Sub Division Level or Office Level export.")
+                continue
+            if bool(x[2]) != bool(y[2]) and kind == "delivery":
+                notes.append(f"{PPT_PRODUCT[sh]}: BOs file given for one period only - only the All Offices slide.")
+            s1, s2 = dict(hq_scopes(x[1], x[2], level)), dict(hq_scopes(y[1], y[2], level))
+            for sc in [k for k in s1 if k in s2]:
+                nh, table = trio_table(level, s1[sc], s2[sc], False, sort, desc, 1)       # % on Invoiced, sorted
+                if len(table) < 2:
+                    continue
+                title = f"D+0 {PPT_PRODUCT[sh]} \u2013 {what} -{wording}"
+                _ppt_slide(prs, title, PPT_TAG[sc], ranges, level, nh, table, kind)
+                count += 1
+    if not count:
+        raise ValueError(" ".join(notes) or "No slides could be made.")
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue(), notes, count
+
+
 # ---------- 2) Compare two report files ----------
 def parse_block(raw, hdr, name_col):
     roles = {}
@@ -1607,6 +1798,24 @@ def page_hq(st):
     st.download_button("Download HQ D+0 Reports (Master Excel Workbook)", data,
                        "HQ_D0_Multi_Period_Reports.xlsx" if multi else "HQ_D0_Reports.xlsx", XLSX, type="primary")
     st.caption(f"{len(previews)} sheets in the Excel.")
+    pairs = hq_ppt_pairs(P, dates)
+    if pairs and st.checkbox("Also create PowerPoint slides (Delivery + Return & Redirection)", key="hq_ppt"):
+        c1, c2, c3 = st.columns(3)
+        pick_cmp = c1.selectbox("Slides compare", list(pairs), key="hq_ppt_cmp")
+        ppt_level = c2.selectbox("Slides level", list(PPT_LEVELS), key="hq_ppt_lv")
+        words = c3.text_input("Title wording", "Week on Week Comparison", key="hq_ppt_words")
+        try:
+            early, later, ra, rb = pairs[pick_cmp]
+            ppt, pnotes, nslides = make_hq_ppt(early, later, (ra, rb), PPT_LEVELS[ppt_level], words)
+            for n in pnotes:
+                st.warning(n)
+            st.download_button(f"Download PowerPoint slides ({nslides} slides)", ppt, "HQ_D0_Slides.pptx",
+                               "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        except ImportError:
+            st.error("PowerPoint needs the python-pptx package: add a line 'python-pptx' to requirements.txt on "
+                     "GitHub, then reboot the app.")
+        except Exception as e:
+            st.error(f"Could not make the slides: {e}")
     if len(previews) > 6:
         pick = st.selectbox("Preview sheet", list(previews))
         views = [(st.container(), previews[pick])]
