@@ -444,7 +444,9 @@ def read_hq(f):
     for i, r in enumerate(df.to_dict("records")):
         div, sub, name = clean(r["Division Name"]), clean(r["Sub Division Name"]), clean(r["Office Name"])
         oid = str(r["office_id"]) if "office_id" in r and pd.notna(r["office_id"]) else f"{div}|{sub}|{name}|{i}"
-        rows.append({"id": oid, "div": div, "sub": sub, "name": name, "c": [float(r[c]) for c in RAW_COLS[1:]]})
+        rows.append({"id": oid, "div": div, "sub": sub, "name": name, "c": [float(r[c]) for c in RAW_COLS[1:]],
+                     "ot": clean(r.get("Office Type", "")),
+                     "pt": [clean(r[c]) for c in ("Product Type", "Product Code", "Product Category") if c in r]})
     return rows, rank
 
 
@@ -1455,6 +1457,223 @@ def make_hq_ppt(early, later, ranges, level, wording, bench=(None, None), rows_p
     return buf.getvalue(), notes, total_slides
 
 
+# ---------- 1j) 24/48 Reports (DDD Letter / DDD Parcel product types) ----------
+DD_PRODUCTS = [("24SPD", "24 SPD", "24 Speed Post Document", "DDD Letter"),
+               ("48SPD", "48 SPD", "48 Speed Post Document", "DDD Letter"),
+               ("24SPP", "24 SPP", "24 Speed Post Parcel", "DDD Parcel"),
+               ("24SPPS", "24 SPP Special", "24 Speed Post Parcel Special", "DDD Parcel"),
+               ("48SPP", "48 SPP", "48 Speed Post Parcel", "DDD Parcel")]
+DD_LEVELS = {"Division Level": "Division", "Sub Division Level": "Sub Division", "Office Level": "Office"}
+OFFICE_TYPES = ["All Offices", "General Post Office", "Head Post Office", "Sub Post Office", "Branch Post Office",
+                "Integrated Delivery Centre", "Nodal Delivery Centre"]
+TINT1, TINT2 = "EDF1E2", "DEEAF6"
+DD_GREEN, DD_RED = "2EA44F", "E5322D"
+
+
+def infer_office_type(name, ot=""):
+    """Office type of a row: from the file's own 'Office Type' when it names a type, else from the office name."""
+    t = str(ot or "").strip().lower()
+    for key, label in (("general post", OFFICE_TYPES[1]), ("head post", OFFICE_TYPES[2]), ("sub post", OFFICE_TYPES[3]),
+                       ("branch post", OFFICE_TYPES[4]), ("integrated delivery", OFFICE_TYPES[5]),
+                       ("nodal delivery", OFFICE_TYPES[6])):
+        if key in t:
+            return label
+    code = {"gpo": OFFICE_TYPES[1], "hpo": OFFICE_TYPES[2], "spo": OFFICE_TYPES[3], "bpo": OFFICE_TYPES[4],
+            "idc": OFFICE_TYPES[5], "dc": OFFICE_TYPES[5], "ndc": OFFICE_TYPES[6]}.get(t)
+    if code:
+        return code
+    n = str(name)
+    for rx, label in ((r"\bNDC\b", OFFICE_TYPES[6]), (r"\b(?:I?DC)\b", OFFICE_TYPES[5]), (r"\bG\.?P\.?O\b", OFFICE_TYPES[1]),
+                      (r"\bH\.?O\b", OFFICE_TYPES[2]), (r"\bB\.?O\b", OFFICE_TYPES[4]), (r"\bS\.?O\b", OFFICE_TYPES[3])):
+        if re.search(rx, n, re.I):
+            return label
+    return ""
+
+
+def dd_read_period(st, f, tag, types):
+    """Uploaded files of one period -> {short name: (full name, [rows], [], level rank)} (one entry per product type)."""
+    out = {}
+    for key, short, full, cat in DD_PRODUCTS:
+        fl = f.get(key)
+        if not fl:
+            continue
+        rows, rank = read_hq(fl)
+        mine = [r for r in rows if full.lower() in [x.lower() for x in r["pt"]]]       # file holds several products
+        rows = mine or rows
+        if types and rank == 2:
+            rows = [r for r in rows if infer_office_type(r["name"], r["ot"]) in types]
+            if not rows:
+                st.warning(f"{tag} - {full}: no offices of the selected office type in the file - skipped.")
+                continue
+        elif types:
+            st.warning(f"{tag} - {full}: the office type filter needs an Office Level export - not applied.")
+        out[short] = (full, [rows], [], rank)
+    return out
+
+
+def make_2448_workbook(P, D, levels, bases, sort=4, desc=True, on=1):
+    """P = {1: .., 2: ..} from dd_read_period. Sheets: every period's D+0 report (per product type), then the
+    Period 1 vs Period 2 comparison (when both periods are given)."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    previews, notes = {}, []
+    txt = lambda t: f"{t[0]:%d.%m.%Y} to {t[1]:%d.%m.%Y}"
+    have = [k for k in (1, 2) if P.get(k)]
+
+    def keep(res):
+        previews.update(res[0])
+        notes.extend(n for n in res[1] if n not in notes)
+
+    for k in have:
+        jobs = [(sh, v[0], v[1], v[2], v[3]) for sh, v in P[k].items()]
+        keep(add_hq_report_sheets(wb, jobs, levels, bases, txt(D[k]), sort, desc, f"P{k} " if len(have) > 1 else ""))
+    if len(have) == 2:
+        cj = []
+        for key, short, full, cat in DD_PRODUCTS:
+            if short in P[1] and short in P[2]:
+                x, y = P[1][short], P[2][short]
+                cj.append((short, x[0], x[1], x[2], y[1], y[2], min(x[3], y[3])))
+            elif short in P[1] or short in P[2]:
+                notes.append(f"{full}: files are needed for both periods - not in the comparison.")
+        keep(add_hq_comparison_sheets(wb, cj, levels, bases, ("Period 1", "Period 2"), (txt(D[1]), txt(D[2])),
+                                      sort, desc, on, "P1vP2 "))
+    if not previews:
+        raise ValueError(" ".join(notes) or "Nothing to make.")
+    return to_bytes(wb), previews, notes
+
+
+def _dd_slide(prs, title, prod, bench, labels, level, npar, rows, total, total_label, recv, logo):
+    """One slide in the 24/48 layout: peach title, benchmark box, logo, yellow header with tinted period blocks."""
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+    from pptx.oxml.ns import qn
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    nn, x0, tw = npar - 1, 0.7, 11.9                                   # Division 1 | Sub Division 2 | Office 3 name columns
+
+    def peach(text, x, w, size, align):
+        box = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(0.5), Inches(w), Inches(0.6))
+        box.fill.solid()
+        box.fill.fore_color.rgb = RGBColor.from_string(PPT_PEACH)
+        box.line.fill.background()
+        box.shadow.inherit = False
+        style = box._element.find(qn("p:style"))
+        if style is not None:
+            box._element.remove(style)
+        tf = box.text_frame
+        tf.vertical_anchor, tf.word_wrap = MSO_ANCHOR.MIDDLE, True
+        tf.margin_left = tf.margin_right = Inches(0.1)
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size, run.font.bold, run.font.name = Pt(size), True, "Calibri"
+        run.font.color.rgb = RGBColor.from_string("000000")
+
+    right = x0 + tw - (1.1 if logo else 0)
+    bw = 0.0
+    if bench:
+        btxt = f"Benchmark: {bench}%"
+        bw = len(btxt) * 20 * 0.0068 + 0.4
+        peach(btxt, right - bw, bw, 20, PP_ALIGN.CENTER)
+    max_w = right - bw - (0.2 if bench else 0) - x0
+    tsize = 26
+    while tsize > 14 and len(title) * tsize * 0.0066 + 0.3 > max_w:
+        tsize -= 1
+    peach(title, x0, min(max_w, len(title) * tsize * 0.0066 + 0.3), tsize, PP_ALIGN.LEFT)
+    if logo:
+        slide.shapes.add_picture(io.BytesIO(logo), Inches(x0 + tw - 0.95), Inches(0.12), height=Inches(1.0))
+    n = len(rows)
+    nrows = n + (1 if total else 0)
+    ncols = nn + 7
+    shape = slide.shapes.add_table(nrows + 2, ncols, Inches(x0), Inches(1.4), Inches(tw), Inches(5.0))
+    tbl = shape.table
+    tbl.first_row = tbl.horz_banding = False
+    namew = {1: [3.4], 2: [2.0, 2.3], 3: [1.7, 1.9, 2.6]}[nn]
+    comp_w = 1.4 if nn < 3 else 1.1
+    num_w = (tw - sum(namew) - comp_w) / 6
+    for j, w in enumerate(namew + [num_w] * 6 + [comp_w]):
+        tbl.columns[j].width = Inches(w)
+    size = 16 if n <= 8 else 14 if n <= 12 else 12 if n <= 16 else 11
+    if level == "Office":
+        size = 11 if n <= 10 else 10
+    h0, h1 = 0.5, 0.62
+    per = min(0.55, (7.5 - 1.4 - 0.3 - h0 - h1) / max(nrows, 1))
+    tbl.rows[0].height, tbl.rows[1].height = Inches(h0), Inches(h1)
+    for r in range(2, nrows + 2):
+        tbl.rows[r].height = Inches(per)
+    cnt_lab = "Received" if recv else "Invoiced"
+    top = [prod] + [""] * (nn - 1) + [labels[0], "", "", labels[1], "", "", ""]
+    heads = ["Division Name", "Sub Division Name", "Office Name"][:nn] + [cnt_lab, "Delivered", "%"] * 2 + ["Comparison"]
+    for j in range(ncols):
+        fill = PPT_YELLOW if (j < nn or j == ncols - 1) else (TINT1 if j < nn + 3 else TINT2)
+        _ppt_cell(tbl.cell(0, j), top[j], size + 1, True, PPT_YELLOW if j < nn or j >= nn + 6 else fill)
+        _ppt_cell(tbl.cell(1, j), heads[j], size, True, fill)
+    for c0, c1 in ((0, nn - 1), (nn, nn + 2), (nn + 3, nn + 5)):
+        if c1 > c0:
+            tbl.cell(0, c0).merge(tbl.cell(0, c1))
+    for i, r in enumerate(rows + ([total] if total else [])):
+        last = bool(total) and i == n
+        m1, m2, ch = r[npar:npar + 12], r[npar + 12:npar + 24], r[npar + 24:npar + 36]
+        cells = lambda m: [str(int(round(m[0 if recv else 1]))), str(int(round(m[3]))), pstr(m[4])]
+        lead = ([total_label] + [""] * (nn - 1)) if last else [ppt_name(x) for x in list(r[2:npar]) + [r[1]]]
+        for j, v in enumerate(lead):
+            _ppt_cell(tbl.cell(2 + i, j), v, size, last, PPT_YELLOW if last else "FFFFFF")
+        for j, v in enumerate(cells(m1) + cells(m2)):
+            _ppt_cell(tbl.cell(2 + i, nn + j), v, size, last, TINT1 if j < 3 else TINT2)
+        d = ch[4]
+        color = "000000" if abs(d) < 0.00005 else (DD_GREEN if d > 0 else DD_RED)
+        _ppt_cell(tbl.cell(2 + i, ncols - 1), pstr(d), size, last, PPT_YELLOW if last else "FFFFFF", color)
+        if last and nn > 1:
+            tbl.cell(2 + i, 0).merge(tbl.cell(2 + i, nn - 1))
+    return slide
+
+
+def make_2448_ppt(P1, P2, ranges, level, wording, bench="", total_label="Total HQR", recv=True, rows_per=15,
+                  max_rows=0, worst_first=False, logo=None, max_slides=700):
+    """One slide (or several for long tables) per product type: Period 1 vs Period 2, % = Delivered / Received (or
+    Invoiced), rows from best to worst Delivery % of Period 2. -> (pptx bytes, notes, number of slides)."""
+    from pptx import Presentation
+    from pptx.util import Inches
+    need = {"Division": 0, "Sub Division": 1, "Office": 2}[level]
+    notes, plan = [], []
+    for key, short, full, cat in DD_PRODUCTS:
+        if short not in P1 or short not in P2:
+            if short in P1 or short in P2:
+                notes.append(f"{full}: files are needed for both periods - no slides.")
+            continue
+        x, y = P1[short], P2[short]
+        if need > min(x[3], y[3]):
+            notes.append(f"{full}: {level}-wise slides need " + ("an Office Level" if level == "Office"
+                                                               else "a Sub Division Level or Office Level") + " export.")
+            continue
+        d1, d2 = hq_scopes(x[1], [], level)[0][1], hq_scopes(y[1], [], level)[0][1]
+        nh, table = trio_table(level, d1, d2, recv, 4, not worst_first, 1)
+        data, total = table[:-1], table[-1]
+        if not data:
+            continue
+        cut = bool(max_rows) and len(data) > max_rows
+        data = data[:max_rows] if cut else data
+        plan.append((full, len(nh), [data[i:i + rows_per] for i in range(0, len(data), rows_per)], total, cut))
+    n_slides = sum(len(p[2]) for p in plan)
+    if not n_slides:
+        raise ValueError(" ".join(notes) or "No slides could be made.")
+    if n_slides > max_slides:
+        raise ValueError(f"That would be {n_slides} slides (limit {max_slides}). Use Sub Division-wise, or set "
+                         "'Max rows per table', or a larger 'Rows per slide'.")
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    for full, npar, pages, total, cut in plan:
+        for i, rows in enumerate(pages):
+            t = f"{full} {wording}" + (f" ({i + 1}/{len(pages)})" if len(pages) > 1 else "")
+            _dd_slide(prs, t, full, bench, ranges, level, npar, rows, total if i == len(pages) - 1 else None,
+                      total_label + (" (all rows)" if cut else ""), recv, logo)
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue(), notes, n_slides
+
+
 # ---------- 2) Compare two report files ----------
 def parse_block(raw, hdr, name_col):
     roles = {}
@@ -2060,6 +2279,119 @@ def page_cod(st):
         df_show(holder, df.style.format(fmt, na_rep=""))
 
 
+def dd_uploaders(sb, prefix, label, expanded=False):
+    """One upload box per product type (DDD Letter: 24 / 48 Speed Post Document; DDD Parcel: 24 / 24 Special / 48)."""
+    ex = sb.expander(label, expanded=expanded)
+    out, cat = {}, None
+    for key, short, full, c in DD_PRODUCTS:
+        if c != cat:
+            ex.subheader(c)
+            cat = c
+        out[key] = ex.file_uploader(full, type=["csv", "xlsx"], key=f"{prefix}_{key}")
+    return out
+
+
+def page_2448(st):
+    sb = st.sidebar
+    today = datetime.date.today()
+    last_prev = today.replace(day=1) - datetime.timedelta(days=1)
+    sb.divider()
+    sb.header("Report Options")
+    lv = sb.multiselect("Report level", list(DD_LEVELS), default=["Sub Division Level"], key="dd24_lv")
+    otypes = sb.multiselect("Office type", OFFICE_TYPES, default=["All Offices"], key="dd24_ot")
+    base = sb.radio("Percentages based on", ["Received", "Invoiced", "Both (two sets of sheets)"], key="dd24_base")
+    sort_by = sb.selectbox("Sort by", list(SORT_OPTIONS), list(SORT_OPTIONS).index("D+0 Delivered %"), key="dd24_sort")
+    order = sb.radio("Order", ORDERS, index=1, key="dd24_order")
+    sort_on = sb.radio("Sort using (when comparing)", ["Earlier period", "Later period", "Comparison"], index=1,
+                       key="dd24_on")
+    dates, files = {}, {}
+    for k, d_from, d_to, head in ((1, last_prev.replace(day=1), last_prev, "Period 1"),
+                                  (2, today.replace(day=1), today, "Period 2 (optional)")):
+        sb.divider()
+        sb.header(head)
+        ca, cb = sb.columns(2)
+        dates[k] = (ca.date_input("From", d_from, key=f"dd24_a{k}"), cb.date_input("To", d_to, key=f"dd24_b{k}"))
+        files[k] = dd_uploaders(sb, f"dd24f{k}", f"Period {k} files", expanded=(k == 1))
+    st.title("24/48 Reports")
+    st.info("Upload the **Delivery Transit Analysis (D-9)** export of each product type: DDD Letter (24 / 48 Speed Post "
+            "Document) and DDD Parcel (24 / 24 Special / 48 Speed Post Parcel). Period 1 alone gives its D+0 report; "
+            "add Period 2 to get both reports and their comparison. Use **Office type** to keep only some offices "
+            "(needs Office Level files). Comparison = Period 2 minus Period 1 (green = better).")
+    if not lv:
+        st.warning("Select at least one report level in the sidebar.")
+        return
+    types = None if (not otypes or "All Offices" in otypes) else set(otypes)
+    try:
+        P = {k: dd_read_period(st, files[k], f"Period {k}", types) for k in (1, 2)}
+    except Exception as e:
+        st.error(f"Could not read the files: {e}")
+        return
+    if not any(P.values()):
+        return
+    bases = {"Received": [True], "Invoiced": [False]}.get(base, [True, False])
+    try:
+        data, previews, notes = make_2448_workbook(P, dates, [DD_LEVELS[k] for k in DD_LEVELS if k in lv], bases,
+                                                   SORT_OPTIONS[sort_by], order == ORDERS[1],
+                                                   ["Earlier period", "Later period", "Comparison"].index(sort_on))
+    except Exception as e:
+        st.error(f"Could not make the report: {e}")
+        return
+    for n in notes:
+        st.warning(n)
+    st.download_button("Download 24/48 Reports (Excel)", data, "24_48_Reports.xlsx", XLSX, type="primary")
+    st.caption(f"{len(previews)} sheets in the Excel.")
+    if P[1] and P[2] and st.checkbox("Also create PowerPoint slides (one per product type)", key="dd24_ppt"):
+        c1, c2, c3 = st.columns(3)
+        ppt_level = c1.selectbox("Slides level", list(PPT_LEVELS), key="dd24_ppt_lv")
+        words = c2.text_input("Title wording", "Week on Week Comparison", key="dd24_ppt_words")
+        bench = c3.text_input("Benchmark % (optional)", "90", key="dd24_ppt_bm")
+        c4, c5, c6 = st.columns(3)
+        total_label = c4.text_input("Total row label", "Total HQR", key="dd24_ppt_tot")
+        rows_per = int(c5.number_input("Rows per slide", min_value=5, max_value=30, value=15, key="dd24_ppt_rows"))
+        max_rows = int(c6.number_input("Max rows per table (0 = all)", min_value=0, max_value=5000, value=0,
+                                       key="dd24_ppt_max"))
+        c7, c8 = st.columns(2)
+        worst = c7.selectbox("Row order", ["Best first (as in the sample)", "Worst first"], key="dd24_ppt_ord")
+        logo_f = c8.file_uploader("Logo for the top right (optional)", type=["png", "jpg", "jpeg"], key="dd24_ppt_logo")
+        logo = logo_f.getvalue() if logo_f else None
+        recv = base != "Invoiced"
+        fsig = tuple((k, name, getattr(f, "name", ""), getattr(f, "size", 0))
+                     for k in (1, 2) for name, f in files[k].items() if f)
+        sig = repr((ppt_level, words, bench, total_label, rows_per, max_rows, worst, recv, len(logo or b""),
+                    sorted(types or []), fsig, sorted(dates.items())))
+        if st.button("Create PowerPoint slides", key="dd24_ppt_btn"):
+            try:
+                txt = lambda k: f"{dates[k][0]:%d.%m.%Y} - {dates[k][1]:%d.%m.%Y}"
+                with st.spinner("Creating the slides..."):
+                    ppt, pnotes, nslides = make_2448_ppt(P[1], P[2], (txt(1), txt(2)), PPT_LEVELS[ppt_level], words,
+                                                         bench_val(bench) or "", total_label, recv, rows_per, max_rows,
+                                                         worst.startswith("Worst"), logo)
+                st.session_state["dd24_ppt_res"] = (sig, ppt, pnotes, nslides)
+            except ImportError:
+                st.error("PowerPoint needs the python-pptx package: add a line 'python-pptx' to requirements.txt on "
+                         "GitHub, then reboot the app.")
+            except Exception as e:
+                st.error(f"Could not make the slides: {e}")
+        res = st.session_state.get("dd24_ppt_res")
+        if res and res[0] == sig:
+            for n in res[2]:
+                st.warning(n)
+            st.download_button(f"Download PowerPoint slides ({res[3]} slides)", res[1], "24_48_Slides.pptx",
+                               "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        elif res:
+            st.info("Settings or files changed - press 'Create PowerPoint slides' again.")
+    if len(previews) > 6:
+        pick = st.selectbox("Preview sheet", list(previews))
+        views = [(st.container(), previews[pick])]
+    else:
+        views = list(zip(st.tabs(list(previews)), previews.values()))
+    for holder, blocks in views:
+        for title, df, fm in blocks:
+            holder.subheader(title)
+            fmt = {c: FMT_PY[f] for c, f in zip(df.columns, fm) if f}
+            df_show(holder, df.style.format(fmt))
+
+
 def page_compare(st):
     st.title("Delivery Transit Analysis (D+0) - Period Comparison")
     st.info("Upload the two report Excel files you want to compare (reports made by this app, or the "
@@ -2093,7 +2425,8 @@ def main():
              "Generate NDC / DC Reports": page_ndc_dc,
              "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare,
              "Text for DC/NDC/24 Reports": page_text, "DSS App report": page_dss,
-             "COD Collection Report": page_cod}
+             "COD Collection Report": page_cod,
+             "24/48 Reports": page_2448}
     pages[st.sidebar.radio("Select", list(pages))](st)
 
 
