@@ -1674,6 +1674,27 @@ def make_2448_ppt(P1, P2, ranges, level, wording, bench="", total_label="Total H
     return buf.getvalue(), notes, n_slides
 
 
+# ---------- 1k) Region wise D+0 reports: the HQ D+0 engine (Period 1 / 2 / 3) with the Region as the unit ----------
+def read_region(f):
+    """Region level raw file -> (rows in the same shape as read_hq, level rank 0). The Region is kept as the
+    'Division' column, so the sheets read 'Name of the Division' exactly like the sample report."""
+    d = read_raw(f)
+    return [{"id": n, "div": n, "sub": "", "name": n, "c": c, "ot": "", "pt": []} for n, c in d.items()], 0
+
+
+def region_read_period(st, f, tag):
+    """Uploaded files of one period -> {sheet: (report name, [All rows], [BO rows], 0)} (same shape as hq_read_period)."""
+    out = {}
+    for sheet, rname, ak, bk, need in HQ_GROUPS:
+        alls, bos = [f[k] for k in ak if f[k]], [f[k] for k in bk if f[k]]
+        if not alls:
+            continue
+        if len(alls) < need or (bos and len(bos) < need):
+            st.warning(f"{tag} - {rname}: only some of the files were uploaded, so the figures are incomplete.")
+        out[sheet] = (rname, [read_region(x)[0] for x in alls], [read_region(x)[0] for x in bos], 0)
+    return out
+
+
 # ---------- 2) Compare two report files ----------
 def parse_block(raw, hdr, name_col):
     roles = {}
@@ -2140,8 +2161,13 @@ def page_text(st):
     for kind, head, d in (("ndc", "NDCs", (95.0, 85.0, 5.0, 5.0)), ("dc", "DCs", (95.0, 85.0, 5.0, 15.0)),
                           ("24", "24 Speed Post (NDCs/DCs)", (85.0, 85.0, 5.0, 10.0))):
         sb.subheader(head)
-        opts[kind] = (num("Daily target %", d[0], f"tx_{kind}_t"),
-                      num("Successful delivery mark % (list offices below)", d[1], f"tx_{kind}_m"),
+        if kind == "24":                    # here the target in the text IS the mark: one box drives both lines
+            mark = num("Successful delivery mark % (the Daily Target line and the list use this)", d[1], "tx_24_m")
+            target = mark
+        else:
+            target = num("Daily target % (shown in the text)", d[0], f"tx_{kind}_t")
+            mark = num("Successful delivery mark % (list offices below)", d[1], f"tx_{kind}_m")
+        opts[kind] = (target, mark,
                       num("Redirection above %", d[2], f"tx_{kind}_r"),
                       num("Return above %", d[3], f"tx_{kind}_x"))
     st.title("Text for DC / NDC / 24 Reports")
@@ -2392,6 +2418,76 @@ def page_2448(st):
             df_show(holder, df.style.format(fmt))
 
 
+def page_region(st):
+    sb = st.sidebar
+    today = datetime.date.today()
+    last_prev = today.replace(day=1) - datetime.timedelta(days=1)
+    sb.divider()
+    dates = {}
+    for k, head, cap, d_from, d_to in [
+            (1, "Period 1", "The base period. Period 2 (+ Period 3) is compared with it.", last_prev.replace(day=1), last_prev),
+            (2, "Period 2", "", today.replace(day=1), today),
+            (3, "Period 3 (optional)", "If given, Period 2 + Period 3 are added together and compared with Period 1.", today, today)]:
+        sb.header(head)
+        if cap:
+            sb.caption(cap)
+        ca, cb = sb.columns(2)
+        dates[k] = (ca.date_input("From", d_from, key=f"rg_a{k}"), cb.date_input("To", d_to, key=f"rg_b{k}"))
+    sb.divider()
+    sb.header("Report Options")
+    base = sb.radio("Percentages based on", ["Received", "Invoiced", "Both (two sets of sheets)"], key="rg_base")
+    sort_by = sb.selectbox("Sort by", list(SORT_OPTIONS), list(SORT_OPTIONS).index(SORT_DEFAULT), key="rg_sort")
+    order = sb.radio("Order", ORDERS, key="rg_order")
+    sort_on = sb.radio("Sort using (when comparing)", ["Earlier period", "Later period", "Comparison"], index=1,
+                       key="rg_on")
+    sb.divider()
+    sb.header("Upload Report Files")
+    sb.caption("Upload the Region level raw files of each period (All Offices file, and optionally the BOs file).")
+    files = {1: hq_uploaders(sb, "rg1", "Period 1 files", True),
+             2: hq_uploaders(sb, "rg2", "Period 2 files"),
+             3: hq_uploaders(sb, "rg3", "Period 3 files (optional)")}
+
+    st.title("Region wise Delivery Transit Analysis (D+0)")
+    st.info("Upload the raw files of **Period 1** from the sidebar to get the Region wise D+0 report. Add **Period 2** "
+            "and it is compared with Period 1. Add **Period 3** as well and Period 2 + Period 3 are added together, "
+            "and that total is compared with Period 1. If you leave **Period 1** empty you still get Period 2, "
+            "Period 3, their comparison and their sum (Period 2 + Period 3). For All Products, Speed Letter and "
+            "Parcels, with BOs and Excluding-BOs tables when a BOs file is given. Comparison columns show later "
+            "minus earlier (green = better, red = worse for the % columns).")
+    try:
+        P = {k: region_read_period(st, files[k], f"Period {k}") for k in (1, 2, 3)}
+    except Exception as e:
+        st.error(f"Could not read the files: {e}")
+        return
+    if not any(P.values()):
+        return
+    bases = {"Received": [True], "Invoiced": [False]}.get(base, [True, False])
+    try:
+        data, previews, notes = make_hq_workbook(P, dates, ["Division"], bases, SORT_OPTIONS[sort_by],
+                                                 order == ORDERS[1],
+                                                 ["Earlier period", "Later period", "Comparison"].index(sort_on))
+    except Exception as e:
+        st.error(f"Could not make the report: {e}")
+        return
+    for n in notes:
+        st.warning(n)
+    multi = sum(1 for k in P if P[k]) > 1
+    st.download_button("Download Region wise D+0 Reports (Master Excel Workbook)", data,
+                       "Region_D0_Multi_Period_Reports.xlsx" if multi else "Region_D0_Reports.xlsx", XLSX,
+                       type="primary")
+    st.caption(f"{len(previews)} sheets in the Excel.")
+    if len(previews) > 6:
+        pick = st.selectbox("Preview sheet", list(previews))
+        views = [(st.container(), previews[pick])]
+    else:
+        views = list(zip(st.tabs(list(previews)), previews.values()))
+    for holder, blocks in views:
+        for title, df, fm in blocks:
+            holder.subheader(title)
+            fmt = {c: FMT_PY[f] for c, f in zip(df.columns, fm) if f}
+            df_show(holder, df.style.format(fmt))
+
+
 def page_compare(st):
     st.title("Delivery Transit Analysis (D+0) - Period Comparison")
     st.info("Upload the two report Excel files you want to compare (reports made by this app, or the "
@@ -2421,7 +2517,7 @@ def main():
     st.set_page_config(page_title="D+0 Analytics", layout="wide")
     if not login(st):
         return
-    pages = {"Region wise D+0 Reports": page_generate, "HQ D+0 Reports": page_hq,
+    pages = {"Region wise D+0 Reports": page_region, "HQ D+0 Reports": page_hq,
              "Generate NDC / DC Reports": page_ndc_dc,
              "DCs Redirection Comparison": page_day, "Compare Two Periods": page_compare,
              "Text for DC/NDC/24 Reports": page_text, "DSS App report": page_dss,
